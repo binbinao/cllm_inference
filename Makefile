@@ -4,7 +4,9 @@
 #   make install    —— 安装到 $(PREFIX)/bin（默认 /usr/local）
 #   make clean      —— 清理编译产物
 
-CXX      ?= clang++
+# 自动检测 C++ 编译器：优先 clang++，其次 g++，最后回退 c++
+# 注意：不能用 ?=，因为 make 内置变量 CXX 已有默认值（c++/g++），?= 不会覆盖
+CXX := $(shell command -v clang++ 2>/dev/null || command -v g++ 2>/dev/null || echo c++)
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra
 LDFLAGS  ?= -pthread
 PREFIX   ?= /usr/local
