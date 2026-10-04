@@ -3,6 +3,7 @@
 自研 **C++20 GGUF 推理引擎**：从零实现，零第三方运行时依赖，支持加载 GGUF 量化模型并在 CPU 上完成推理，提供 OpenAI 兼容的 HTTP 服务。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/binbinao/cllm_inference?utm_source=readme&utm_medium=badge)
 
 ## 特性
 
@@ -14,6 +15,46 @@
 - **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
 - **对话模板**：自动识别 Qwen 等 chat 模型并应用 `<|im_start|>` 对话模板
 - **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
+
+---
+
+## 项目架构
+
+系统由「模型加载 → 推理引擎 → 采样解码」三条主线与「HTTP 服务」旁路组成，全部为自研 C++ 模块，零第三方运行时依赖：
+
+```
+                        ┌─────────────────────────────────────────┐
+                        │              main.cpp（双入口）           │
+                        └───────┬──────────────────────┬──────────┘
+                 --prompt      │ 加载模型               │ 无 --prompt 时
+                        ┌───────▼─────────┐            │ 启动服务
+                        │   GgufLoader    │      ┌─────▼──────────┐
+                        │  GGUF 解析·mmap │      │   HttpServer   │
+                        └───────┬─────────┘      │ :8080·SSE 流式 │
+                                │ 张量/词表        └─────┬──────────┘
+                        ┌───────▼────────────────────────▼──────────┐
+                        │            TransformerEngine               │
+                        │  RMSNorm · RoPE · GQA Attention · SwiGLU   │
+                        │              KV Cache（自回归）             │
+                        └───┬───────────────┬──────────────┬────────┘
+                            │ 反量化权重     │ 并行矩阵乘    │ logits
+                     ┌──────▼─────┐   ┌─────▼──────┐  ┌────▼─────┐
+                     │   Quant    │   │ ThreadPool │  │  Sampler │──┐
+                     │  反量化     │   │  并行分块   │  │ top-k/p  │  │ next token
+                     └────────────┘   └────────────┘  └──────────┘◄─┘
+```
+
+| 模块 | 职责 | 关键文件 |
+|------|------|---------|
+| `GgufLoader` | 解析 GGUF 元数据/词表/张量，mmap 零拷贝加载 | `src/core/gguf.cpp` |
+| `Quant` | GGML 量化权重（Q4_K/Q5_0/Q6_K/Q8_0/F32/F16）反量化为 float32 | `src/core/quant.cpp` |
+| `TransformerEngine` | 单步前向：RMSNorm + NEOX RoPE + GQA Attention + SwiGLU FFN，更新 KV Cache | `src/core/engine.cpp` |
+| `Tokenizer` | BPE（gpt2 类）/ SentencePiece 双模式编解码 + Qwen chat template | `src/core/tokenizer.cpp` |
+| `Sampler` | temperature / top-k / top-p 采样，从 logits 采样下一个 token | `src/core/sampler.cpp` |
+| `ThreadPool` | 手写线程池，按行/分块并行矩阵乘 | `src/core/thread_pool.cpp` |
+| `HttpServer` | 纯标准库实现的 OpenAI 兼容 HTTP 服务（含 SSE 流式） | `src/server/http_server.cpp` |
+
+> 推理采用自回归流程：`main.cpp` 先 forward 整个 prompt，随后循环「采样 → decode → forward 下一个 token」直至 EOS 或达到 `max_tokens`。CLI 与 HTTP 两种入口复用同一套 `Tokenizer` 与 `TransformerEngine`。
 
 ---
 
