@@ -14,3 +14,16 @@ target_include_directories(cllm_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include
 # 可执行文件
 add_executable(cllm_inference main.cpp)
 target_link_libraries(cllm_inference PRIVATE cllm_core)
+
+# 线程支持（Linux 下需显式链接 pthread，macOS 无害）
+find_package(Threads REQUIRED)
+target_link_libraries(cllm_inference PRIVATE Threads::Threads)
+
+# ---- 安装规则 ----
+include(GNUInstallDirs)
+
+# 安装可执行文件到 <prefix>/bin
+install(TARGETS cllm_inference RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# 安装头文件到 <prefix>/include（供二次开发）
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
