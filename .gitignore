@@ -21,6 +21,11 @@ cmake-build-*/
 
 # 工具目录（specmate skill 安装，含二进制）
 /.codebuddy/
+# specmate 规范文档目录（本地开发用，不纳入版本控制）
+/specmate/
+
+# archify 架构图工具产物（本地生成，不纳入版本控制）
+/.archify/
 
 # macOS
 .DS_Store
