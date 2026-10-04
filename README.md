@@ -2,6 +2,8 @@
 
 自研 **C++20 GGUF 推理引擎**：从零实现，零第三方运行时依赖，支持加载 GGUF 量化模型并在 CPU 上完成推理，提供 OpenAI 兼容的 HTTP 服务。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ## 特性
 
 - **纯 C++20 / 零依赖**：仅依赖标准库与 POSIX 系统调用，无任何第三方库
