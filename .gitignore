@@ -1,0 +1,25 @@
+# 构建产物
+/build/
+/cmake-build-debug/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.dylib
+*.so
+*.exe
+
+# 模型权重文件（体积大，不纳入版本控制）
+/models/
+
+# IDE 配置
+/.idea/
+/.vscode/
+*.iml
+
+# 工具目录（specmate skill 安装，含二进制）
+/.codebuddy/
+
+# macOS
+.DS_Store
