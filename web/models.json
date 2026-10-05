@@ -1,0 +1,149 @@
+{
+  "updated": "2026-10-05",
+  "note": "内置模型清单：仅列出 Qwen 与 Llama 系列（≤30B）常用 GGUF。下载后将 .gguf 文件放入项目的 models/ 目录，使用 --model models/<文件名> 启动即可。",
+  "models": [
+    {
+      "id": "qwen2.5-0.5b-instruct-q4_k_m",
+      "name": "Qwen2.5 0.5B Instruct (Q4_K_M)",
+      "family": "qwen",
+      "params": "0.5B",
+      "quant": "Q4_K_M",
+      "size_mb": 395,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    },
+    {
+      "id": "qwen2.5-1.5b-instruct-q4_k_m",
+      "name": "Qwen2.5 1.5B Instruct (Q4_K_M)",
+      "family": "qwen",
+      "params": "1.5B",
+      "quant": "Q4_K_M",
+      "size_mb": 986,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    },
+    {
+      "id": "qwen2.5-3b-instruct-q4_k_m",
+      "name": "Qwen2.5 3B Instruct (Q4_K_M)",
+      "family": "qwen",
+      "params": "3B",
+      "quant": "Q4_K_M",
+      "size_mb": 1930,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+      "file": "qwen2.5-3b-instruct-q4_k_m.gguf"
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q4_k_m",
+      "name": "Qwen2.5 7B Instruct (Q4_K_M)",
+      "family": "qwen",
+      "params": "7B",
+      "quant": "Q4_K_M",
+      "size_mb": 4680,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
+      "file": "qwen2.5-7b-instruct-q4_k_m.gguf"
+    },
+    {
+      "id": "qwen2.5-14b-instruct-q4_k_m",
+      "name": "Qwen2.5 14B Instruct (Q4_K_M)",
+      "family": "qwen",
+      "params": "14B",
+      "quant": "Q4_K_M",
+      "size_mb": 8990,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf",
+      "file": "qwen2.5-14b-instruct-q4_k_m.gguf"
+    },
+    {
+      "id": "qwen3-0.6b-q4_k_m",
+      "name": "Qwen3 0.6B (Q4_K_M)",
+      "family": "qwen",
+      "params": "0.6B",
+      "quant": "Q4_K_M",
+      "size_mb": 460,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+      "file": "Qwen3-0.6B-Q4_K_M.gguf"
+    },
+    {
+      "id": "qwen3-1.7b-q4_k_m",
+      "name": "Qwen3 1.7B (Q4_K_M)",
+      "family": "qwen",
+      "params": "1.7B",
+      "quant": "Q4_K_M",
+      "size_mb": 1130,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+      "file": "Qwen3-1.7B-Q4_K_M.gguf"
+    },
+    {
+      "id": "qwen3-4b-q4_k_m",
+      "name": "Qwen3 4B (Q4_K_M)",
+      "family": "qwen",
+      "params": "4B",
+      "quant": "Q4_K_M",
+      "size_mb": 2500,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+      "file": "Qwen3-4B-Q4_K_M.gguf"
+    },
+    {
+      "id": "qwen3-8b-q4_k_m",
+      "name": "Qwen3 8B (Q4_K_M)",
+      "family": "qwen",
+      "params": "8B",
+      "quant": "Q4_K_M",
+      "size_mb": 5100,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+      "file": "Qwen3-8B-Q4_K_M.gguf"
+    },
+    {
+      "id": "qwen3-14b-q4_k_m",
+      "name": "Qwen3 14B (Q4_K_M)",
+      "family": "qwen",
+      "params": "14B",
+      "quant": "Q4_K_M",
+      "size_mb": 9080,
+      "ctx": 32768,
+      "url": "https://huggingface.co/Qwen/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf",
+      "file": "Qwen3-14B-Q4_K_M.gguf"
+    },
+    {
+      "id": "llama-3.2-1b-instruct-q4_k_m",
+      "name": "Llama 3.2 1B Instruct (Q4_K_M)",
+      "family": "llama",
+      "params": "1B",
+      "quant": "Q4_K_M",
+      "size_mb": 808,
+      "ctx": 131072,
+      "url": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+      "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+    },
+    {
+      "id": "llama-3.2-3b-instruct-q4_k_m",
+      "name": "Llama 3.2 3B Instruct (Q4_K_M)",
+      "family": "llama",
+      "params": "3B",
+      "quant": "Q4_K_M",
+      "size_mb": 2020,
+      "ctx": 131072,
+      "url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+      "file": "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+    },
+    {
+      "id": "llama-3.1-8b-instruct-q4_k_m",
+      "name": "Llama 3.1 8B Instruct (Q4_K_M)",
+      "family": "llama",
+      "params": "8B",
+      "quant": "Q4_K_M",
+      "size_mb": 4920,
+      "ctx": 131072,
+      "url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "file": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    }
+  ]
+}

@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>cllm_inference · 本地对话</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a22; --panel2:#1b2130; --border:#262c3a;
+    --fg:#e6e8ee; --muted:#8d95a6; --accent:#6ea8ff; --accent2:#9f7cff;
+    --user:#2a3b5f; --asst:#1f2a3b; --warn:#f0b429; --err:#ff6b6b;
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f7f8fb; --panel:#ffffff; --panel2:#f0f2f7; --border:#d9dde6;
+           --fg:#101318; --muted:#5a6478; --user:#dbe8ff; --asst:#eef1f8; }
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; margin:0; }
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+    background:var(--bg); color:var(--fg); font-size:14px; line-height:1.55;
+  }
+  .app{ display:grid; grid-template-columns:300px 1fr; height:100vh; }
+  /* ---- 侧栏 ---- */
+  aside{
+    background:var(--panel); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .brand{ padding:16px 18px; border-bottom:1px solid var(--border); }
+  .brand h1{ margin:0; font-size:16px; letter-spacing:.5px; }
+  .brand small{ color:var(--muted); }
+  .section{ padding:14px 18px; border-bottom:1px solid var(--border); }
+  .section h2{ margin:0 0 10px; font-size:12px; color:var(--muted); font-weight:600; letter-spacing:1px; text-transform:uppercase; }
+  .status{ display:flex; align-items:center; gap:8px; }
+  .dot{ width:8px; height:8px; border-radius:50%; background:#555; }
+  .dot.ok{ background:#44cc77; } .dot.err{ background:var(--err); }
+  .kv{ display:grid; grid-template-columns:auto 1fr; gap:4px 10px; font-size:12px; color:var(--muted); margin-top:8px; }
+  .kv b{ color:var(--fg); font-weight:500; }
+  select,input,button,textarea{
+    font:inherit; color:var(--fg); background:var(--panel2);
+    border:1px solid var(--border); border-radius:8px; padding:8px 10px; width:100%;
+  }
+  button{ cursor:pointer; background:var(--accent); color:#fff; border-color:transparent; transition:filter .15s; }
+  button:hover{ filter:brightness(1.1); }
+  button.ghost{ background:transparent; color:var(--fg); }
+  button.danger{ background:transparent; color:var(--err); border-color:var(--border); }
+  button[disabled]{ opacity:.5; cursor:not-allowed; }
+  .row{ display:flex; gap:8px; }
+  .row > *{ flex:1; }
+  .model-list{ max-height:260px; overflow:auto; display:flex; flex-direction:column; gap:6px; }
+  .model-item{
+    background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+    padding:8px 10px; font-size:12px; cursor:pointer; transition:border-color .15s;
+  }
+  .model-item:hover{ border-color:var(--accent); }
+  .model-item.active{ border-color:var(--accent); background:color-mix(in srgb,var(--accent) 15%,var(--panel2)); }
+  .model-item .top{ display:flex; justify-content:space-between; align-items:center; }
+  .model-item .name{ font-weight:600; color:var(--fg); }
+  .model-item .meta{ color:var(--muted); margin-top:3px; font-size:11px; }
+  .tag{ display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px;
+        background:var(--panel); border:1px solid var(--border); color:var(--muted); margin-right:4px; }
+  .tag.qwen{ color:#6ea8ff; }
+  .tag.llama{ color:#9f7cff; }
+  /* ---- 主区 ---- */
+  main{ display:flex; flex-direction:column; min-width:0; }
+  .toolbar{
+    padding:10px 18px; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center; gap:12px;
+  }
+  .toolbar .model-name{ font-weight:600; }
+  .toolbar .model-name small{ color:var(--muted); margin-left:6px; font-weight:400; }
+  .toolbar .actions{ display:flex; gap:8px; }
+  .toolbar button{ width:auto; padding:6px 12px; font-size:12px; }
+  .chat{ flex:1; overflow:auto; padding:24px 0; }
+  .msg{ max-width:820px; margin:0 auto 14px; padding:0 24px; display:flex; gap:12px; }
+  .msg .avatar{
+    width:28px; height:28px; border-radius:50%; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    font-size:12px; font-weight:600; color:#fff;
+  }
+  .msg.user .avatar{ background:linear-gradient(135deg,#6ea8ff,#4a7cff); }
+  .msg.assistant .avatar{ background:linear-gradient(135deg,#9f7cff,#7a5cff); }
+  .msg.system .avatar{ background:#777; }
+  .msg .bubble{
+    background:var(--asst); padding:10px 14px; border-radius:var(--radius);
+    white-space:pre-wrap; word-wrap:break-word; min-width:0; flex:1;
+  }
+  .msg.user .bubble{ background:var(--user); }
+  .msg .bubble .role{ font-size:11px; color:var(--muted); margin-bottom:4px; }
+  .msg .bubble .content.loading::after{
+    content:"▍"; animation:blink 1s steps(1) infinite; color:var(--muted);
+  }
+  @keyframes blink{ 50%{ opacity:0; } }
+  .empty{
+    text-align:center; color:var(--muted); margin:80px auto; max-width:420px;
+  }
+  .empty h3{ color:var(--fg); margin-bottom:8px; }
+  /* ---- 输入区 ---- */
+  .composer{ border-top:1px solid var(--border); padding:14px 24px; background:var(--panel); }
+  .composer-wrap{ max-width:820px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
+  textarea#input{
+    resize:none; min-height:44px; max-height:200px; line-height:1.5;
+    background:var(--panel2);
+  }
+  .composer button{ width:auto; padding:10px 20px; }
+  .params{ max-width:820px; margin:8px auto 0; display:flex; gap:12px; font-size:12px; color:var(--muted); }
+  .params label{ display:flex; align-items:center; gap:6px; }
+  .params input[type=number]{ width:70px; padding:3px 6px; font-size:12px; }
+  /* ---- 模态框 ---- */
+  .modal-bg{
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:none; align-items:center; justify-content:center; z-index:50;
+  }
+  .modal-bg.open{ display:flex; }
+  .modal{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    max-width:600px; width:92%; max-height:80vh; overflow:auto; padding:20px 22px;
+  }
+  .modal h3{ margin-top:0; }
+  .modal pre{
+    background:var(--panel2); padding:10px 12px; border-radius:6px;
+    overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all;
+  }
+  .modal code{ font-family:"SF Mono",Menlo,Consolas,monospace; }
+  .modal .close{ float:right; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ========== 侧栏 ========== -->
+  <aside>
+    <div class="brand">
+      <h1>cllm_inference</h1>
+      <small>纯 C++20 · 零依赖 · 本地推理</small>
+    </div>
+
+    <!-- 当前模型 -->
+    <div class="section">
+      <h2>当前模型</h2>
+      <div class="status"><span class="dot" id="dot"></span><span id="status-text">未连接</span></div>
+      <div class="kv" id="model-info" style="display:none;">
+        <span>架构</span><b id="mi-arch">—</b>
+        <span>参数</span><b id="mi-shape">—</b>
+        <span>上下文</span><b id="mi-ctx">—</b>
+        <span>模板</span><b id="mi-tpl">—</b>
+      </div>
+      <div style="margin-top:10px; display:flex; gap:8px;">
+        <button class="ghost" style="font-size:12px; padding:6px 10px;" id="btn-refresh">刷新</button>
+      </div>
+    </div>
+
+    <!-- 模型库 -->
+    <div class="section" style="flex:1; overflow:auto;">
+      <h2>模型库（Qwen / Llama ≤30B）</h2>
+      <div style="margin-bottom:8px;">
+        <select id="family-filter">
+          <option value="all">全部</option>
+          <option value="qwen">Qwen</option>
+          <option value="llama">Llama</option>
+        </select>
+      </div>
+      <div class="model-list" id="model-list"></div>
+      <p style="font-size:11px; color:var(--muted); margin-top:8px;">
+        说明：模型需要先下载到本地 <code>models/</code> 目录。点击模型获取启动命令。
+      </p>
+    </div>
+  </aside>
+
+  <!-- ========== 主区 ========== -->
+  <main>
+    <div class="toolbar">
+      <div class="model-name">
+        <span id="tb-model">—</span>
+        <small id="tb-sub"></small>
+      </div>
+      <div class="actions">
+        <button class="ghost" id="btn-clear">清空对话</button>
+      </div>
+    </div>
+
+    <div class="chat" id="chat">
+      <div class="empty" id="empty">
+        <h3>👋 欢迎使用 cllm_inference</h3>
+        <p>当前对话会实时流式返回。先在左侧确认已加载模型，然后开始提问。</p>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-wrap">
+        <textarea id="input" placeholder="输入消息，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+        <button id="btn-send">发送</button>
+      </div>
+      <div class="params">
+        <label>温度 <input type="number" id="p-temp" min="0" max="2" step="0.1" value="0.7"></label>
+        <label>top-p <input type="number" id="p-topp" min="0" max="1" step="0.05" value="0.9"></label>
+        <label>top-k <input type="number" id="p-topk" min="0" max="200" step="1" value="40"></label>
+        <label>最大 tokens <input type="number" id="p-max" min="1" max="4096" step="16" value="256"></label>
+        <label style="margin-left:auto;"><input type="checkbox" id="p-stream" checked> 流式</label>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 启动命令模态框 -->
+<div class="modal-bg" id="modal-bg">
+  <div class="modal">
+    <button class="ghost close" onclick="closeModal()">关闭</button>
+    <h3 id="m-title">启动命令</h3>
+    <p style="color:var(--muted); font-size:13px;" id="m-sub"></p>
+    <h4 style="margin-bottom:6px;">1. 下载模型</h4>
+    <pre id="m-download"></pre>
+    <h4 style="margin-bottom:6px;">2. 启动服务</h4>
+    <pre id="m-launch"></pre>
+    <p style="color:var(--muted); font-size:12px;">
+      启动后浏览器刷新即可自动连接。<br>
+      注：本工具不做运行期热切换，切换模型请先 <code>Ctrl+C</code> 终止再重启。
+    </p>
+  </div>
+</div>
+
+<script>
+// —— 后端地址：优先用页面所在 origin（当从后端静态托管访问时）；否则默认 8080
+const API_BASE = (location.origin && location.origin.startsWith("http"))
+  ? location.origin : "http://127.0.0.1:8080";
+
+const $ = (id) => document.getElementById(id);
+const chat = $("chat");
+const empty = $("empty");
+let currentModel = null;   // 后端返回的当前模型信息
+let allModels = [];        // 清单
+const messages = [];       // 对话历史（含 role/content）
+let aborter = null;        // 当前请求的 AbortController
+
+// ========== 模型信息 ==========
+async function fetchModelInfo(){
+  $("dot").className = "dot";
+  $("status-text").textContent = "连接中…";
+  try{
+    const res = await fetch(API_BASE + "/v1/model/info");
+    if(!res.ok) throw new Error("HTTP "+res.status);
+    const info = await res.json();
+    currentModel = info;
+    $("dot").className = "dot ok";
+    $("status-text").textContent = "已连接";
+    $("model-info").style.display = "grid";
+    $("mi-arch").textContent = info.architecture || "—";
+    $("mi-shape").textContent = `${info.n_layers}L · ${info.n_embd}h · ${info.n_head}×${info.n_head_kv}头`;
+    $("mi-ctx").textContent = info.n_ctx;
+    $("mi-tpl").textContent = info.has_chat_template ? (info.chat_template_format || "yes") : "无";
+    $("tb-model").textContent = info.id;
+    $("tb-sub").textContent = `· ${info.architecture}`;
+    highlightActiveModel();
+  }catch(e){
+    $("dot").className = "dot err";
+    $("status-text").textContent = "后端未就绪";
+    $("tb-model").textContent = "未加载模型";
+    $("tb-sub").textContent = "";
+  }
+}
+
+// ========== 模型清单 ==========
+async function fetchModels(){
+  try{
+    const res = await fetch("models.json");
+    if(!res.ok) throw new Error("models.json 加载失败");
+    const data = await res.json();
+    allModels = data.models || [];
+    renderModelList();
+  }catch(e){
+    $("model-list").innerHTML =
+      '<p style="color:var(--err); font-size:12px;">模型清单加载失败：' + e.message +
+      '<br>请从后端启动（如 <code>make run</code>）或将 web/ 目录静态托管。</p>';
+  }
+}
+
+function renderModelList(){
+  const filter = $("family-filter").value;
+  const items = allModels.filter(m => filter === "all" || m.family === filter);
+  $("model-list").innerHTML = items.map(m => `
+    <div class="model-item" data-id="${m.id}" data-file="${m.file}">
+      <div class="top">
+        <span class="name">${escapeHtml(m.name)}</span>
+        <span class="tag ${m.family}">${m.family}</span>
+      </div>
+      <div class="meta">
+        ${m.params} · ${m.quant} · ${formatSize(m.size_mb)} · ctx ${m.ctx}
+      </div>
+    </div>
+  `).join("");
+  document.querySelectorAll(".model-item").forEach(el => {
+    el.onclick = () => showLaunchCommand(el.dataset.id);
+  });
+  highlightActiveModel();
+}
+
+function highlightActiveModel(){
+  if(!currentModel) return;
+  document.querySelectorAll(".model-item").forEach(el => {
+    el.classList.toggle("active", el.dataset.file === currentModel.id);
+  });
+}
+
+function showLaunchCommand(id){
+  const m = allModels.find(x => x.id === id);
+  if(!m) return;
+  $("m-title").textContent = m.name;
+  $("m-sub").textContent = `${m.params} 参数 · ${m.quant} · 磁盘 ${formatSize(m.size_mb)}`;
+  $("m-download").textContent =
+    `mkdir -p models\n` +
+    `curl -L -o models/${m.file} \\\n  "${m.url}"`;
+  $("m-launch").textContent =
+    `./cllm_inference --model models/${m.file} --port 8080\n` +
+    `# 启动后浏览器打开 http://127.0.0.1:8080/`;
+  $("modal-bg").classList.add("open");
+}
+function closeModal(){ $("modal-bg").classList.remove("open"); }
+
+// ========== 对话 ==========
+function addMessage(role, content, loading=false){
+  if(empty) empty.style.display = "none";
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  const avatar = role === "user" ? "我" : (role === "assistant" ? "AI" : "S");
+  div.innerHTML = `
+    <div class="avatar">${avatar}</div>
+    <div class="bubble">
+      <div class="role">${role}</div>
+      <div class="content${loading?' loading':''}"></div>
+    </div>`;
+  div.querySelector(".content").textContent = content;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div.querySelector(".content");
+}
+
+async function send(){
+  const text = $("input").value.trim();
+  if(!text || aborter) return;
+  if(!currentModel){
+    alert("后端未就绪，请先启动 cllm_inference 服务");
+    return;
+  }
+  $("input").value = "";
+  autoGrow($("input"));
+  addMessage("user", text);
+  messages.push({ role:"user", content:text });
+
+  const stream = $("p-stream").checked;
+  const body = {
+    model: currentModel.id,
+    messages: messages,
+    temperature: parseFloat($("p-temp").value),
+    top_p: parseFloat($("p-topp").value),
+    top_k: parseInt($("p-topk").value, 10),
+    max_tokens: parseInt($("p-max").value, 10),
+    stream: stream
+  };
+
+  const target = addMessage("assistant", "", true);
+  $("btn-send").disabled = true; $("btn-send").textContent = "生成中…";
+  aborter = new AbortController();
+  let acc = "";
+  try{
+    const res = await fetch(API_BASE + "/v1/chat/completions", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(body),
+      signal: aborter.signal
+    });
+    if(!res.ok) throw new Error("HTTP " + res.status);
+
+    if(stream){
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while(true){
+        const { done, value } = await reader.read();
+        if(done) break;
+        buf += dec.decode(value, { stream:true });
+        // 处理 SSE 行
+        let idx;
+        while((idx = buf.indexOf("\n\n")) !== -1){
+          const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          for(const line of chunk.split("\n")){
+            if(!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if(data === "[DONE]"){ break; }
+            try{
+              const obj = JSON.parse(data);
+              const delta = obj.choices?.[0]?.delta?.content;
+              if(delta){
+                acc += delta;
+                target.textContent = acc;
+                chat.scrollTop = chat.scrollHeight;
+              }
+            }catch(e){ /* 忽略解析错误 */ }
+          }
+        }
+      }
+    } else {
+      const obj = await res.json();
+      acc = obj.choices?.[0]?.message?.content || obj.choices?.[0]?.text || "";
+      target.textContent = acc;
+    }
+    target.classList.remove("loading");
+    messages.push({ role:"assistant", content: acc });
+  }catch(e){
+    target.classList.remove("loading");
+    target.textContent = (acc || "") + "\n\n[错误] " + e.message;
+  }finally{
+    aborter = null;
+    $("btn-send").disabled = false; $("btn-send").textContent = "发送";
+  }
+}
+
+function clearChat(){
+  if(aborter){ aborter.abort(); aborter = null; }
+  messages.length = 0;
+  chat.innerHTML = ""; chat.appendChild(empty);
+  empty.style.display = "";
+  $("btn-send").disabled = false; $("btn-send").textContent = "发送";
+}
+
+// ========== 工具 ==========
+function escapeHtml(s){
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function formatSize(mb){
+  if(mb >= 1024) return (mb/1024).toFixed(1) + " GB";
+  return mb + " MB";
+}
+function autoGrow(el){
+  el.style.height = "auto";
+  el.style.height = Math.min(200, el.scrollHeight) + "px";
+}
+
+// ========== 事件绑定 ==========
+$("btn-send").onclick = send;
+$("btn-clear").onclick = clearChat;
+$("btn-refresh").onclick = () => { fetchModelInfo(); fetchModels(); };
+$("family-filter").onchange = renderModelList;
+$("input").addEventListener("input", (e) => autoGrow(e.target));
+$("input").addEventListener("keydown", (e) => {
+  if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$("modal-bg").addEventListener("click", (e) => {
+  if(e.target === $("modal-bg")) closeModal();
+});
+
+// 初始化
+fetchModelInfo();
+fetchModels();
+</script>
+</body>
+</html>

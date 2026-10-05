@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -81,6 +82,86 @@ std::string json_escape(const std::string& s) {
     return o;
 }
 
+// 统一的 CORS 响应头片段（允许所有源，便于本地 web 前端直接访问）
+const char* CORS_HEADERS =
+    "Access-Control-Allow-Origin: *\r\n"
+    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+
+// 从 OpenAI chat messages 数组中解析 (role, content) 对，保留顺序。
+// 极简解析：按 "role":"..." 与 "content":"..." 顺序配对，兼容单个 messages 对象或数组。
+std::vector<std::pair<std::string, std::string>>
+parse_messages(const std::string& body) {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t p = body.find("\"messages\"");
+    if (p == std::string::npos) return out;
+    size_t arr_start = body.find('[', p);
+    size_t arr_end = body.find(']', arr_start == std::string::npos ? p : arr_start);
+    if (arr_start == std::string::npos || arr_end == std::string::npos) return out;
+
+    size_t cur = arr_start;
+    while (cur < arr_end) {
+        size_t r = body.find("\"role\"", cur);
+        if (r == std::string::npos || r > arr_end) break;
+        size_t rc = body.find(':', r);
+        size_t rs = body.find('"', rc + 1);
+        size_t re = body.find('"', rs + 1);
+        if (rs == std::string::npos || re == std::string::npos) break;
+        std::string role = body.substr(rs + 1, re - rs - 1);
+
+        size_t c = body.find("\"content\"", re);
+        if (c == std::string::npos || c > arr_end) break;
+        size_t cc = body.find(':', c);
+        size_t cs = body.find('"', cc + 1);
+        if (cs == std::string::npos) break;
+        // content 字符串需要处理转义：读到未转义的 "
+        std::string content;
+        size_t i = cs + 1;
+        for (; i < arr_end; ++i) {
+            char ch = body[i];
+            if (ch == '\\' && i + 1 < arr_end) {
+                char n = body[i + 1];
+                if (n == 'n') content += '\n';
+                else if (n == 't') content += '\t';
+                else if (n == 'r') content += '\r';
+                else content += n;
+                ++i;
+            } else if (ch == '"') {
+                break;
+            } else {
+                content += ch;
+            }
+        }
+        out.emplace_back(std::move(role), std::move(content));
+        cur = i + 1;
+    }
+    return out;
+}
+
+// 根据路径返回 MIME 类型
+std::string guess_mime(const std::string& path) {
+    auto ends = [&](const char* ext) {
+        size_t n = std::strlen(ext);
+        return path.size() >= n && std::memcmp(path.data() + path.size() - n, ext, n) == 0;
+    };
+    if (ends(".html") || ends(".htm")) return "text/html; charset=utf-8";
+    if (ends(".js")) return "application/javascript; charset=utf-8";
+    if (ends(".css")) return "text/css; charset=utf-8";
+    if (ends(".json")) return "application/json; charset=utf-8";
+    if (ends(".svg")) return "image/svg+xml";
+    if (ends(".png")) return "image/png";
+    return "application/octet-stream";
+}
+
+// 读取文件全部内容；失败返回空 string + ok=false
+std::string read_file_all(const std::string& path, bool& ok) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { ok = false; return {}; }
+    std::ostringstream ss; ss << f.rdbuf();
+    ok = true;
+    return ss.str();
+}
+
 // 读取一行（以 \r\n 或 \n 结尾）
 std::string read_line(int fd) {
     std::string line;
@@ -109,6 +190,8 @@ struct HttpServer::Impl {
     TransformerEngine* engine;
     Tokenizer* tokenizer;
     uint16_t port;
+    std::string model_path;   // 当前加载模型文件路径（用于 /v1/model/info）
+    std::string web_root;     // 前端静态目录（存在则托管 /、/web/*）
     int listen_fd = -1;
     std::atomic<bool> running{false};
     std::mutex engine_mtx;   // 保护引擎推理（KV Cache 共享状态）
@@ -151,48 +234,139 @@ struct HttpServer::Impl {
             }
         }
 
-        if (path == "/health") {
+        // CORS 预检
+        if (method == "OPTIONS") {
             std::string resp =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                "Content-Length: 15\r\nConnection: close\r\n\r\n"
-                "{\"status\":\"ok\"}";
+                std::string("HTTP/1.1 204 No Content\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(client_fd, resp);
+            close(client_fd);
+            return;
+        }
+
+        if (path == "/health") {
+            std::string body_s = "{\"status\":\"ok\"}";
+            std::string resp =
+                std::string("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n") + CORS_HEADERS +
+                "Content-Length: " + std::to_string(body_s.size()) +
+                "\r\nConnection: close\r\n\r\n" + body_s;
+            send_all(client_fd, resp);
+        } else if (path == "/v1/model/info" || path == "/v1/models") {
+            handle_model_info(client_fd, path);
         } else if (path == "/v1/completions" || path == "/v1/chat/completions") {
             handle_generate(client_fd, body, path);
+        } else if (path == "/" || path.rfind("/web/", 0) == 0 || path.rfind("/models.json", 0) == 0) {
+            handle_static(client_fd, path);
         } else {
             std::string resp =
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                std::string("HTTP/1.1 404 Not Found\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(client_fd, resp);
         }
         close(client_fd);
     }
 
-    // 从请求体中提取 prompt（兼容 completions 与 chat）
-    std::string extract_prompt(const std::string& body, const std::string& path) {
-        if (path == "/v1/chat/completions") {
-            // chat 模式：messages 数组中 content 字段，取最后一个 user 内容
-            std::string prompt;
-            // 简化：提取所有 "content":"..." 并拼接（以换行分隔）
-            size_t p = 0;
-            std::string key = "\"content\"";
-            while ((p = body.find(key, p)) != std::string::npos) {
-                size_t q = body.find(':', p + key.size());
-                if (q == std::string::npos) break;
-                size_t s = body.find('"', q + 1);
-                if (s == std::string::npos) break;
-                size_t e = body.find('"', s + 1);
-                if (e == std::string::npos) break;
-                if (!prompt.empty()) prompt += "\n";
-                prompt += body.substr(s + 1, e - s - 1);
-                p = e + 1;
-            }
-            return prompt;
+    // 返回当前加载模型的元信息；/v1/models 走 OpenAI 兼容格式
+    void handle_model_info(int client_fd, const std::string& path) {
+        const auto& cfg = engine->config();
+        // 从 model_path 中提取文件名作为 id
+        std::string id = model_path;
+        size_t slash = id.find_last_of('/');
+        if (slash != std::string::npos) id = id.substr(slash + 1);
+        if (id.empty()) id = cfg.arch;
+
+        std::string info =
+            "{\"id\":\"" + json_escape(id) + "\","
+            "\"path\":\"" + json_escape(model_path) + "\","
+            "\"architecture\":\"" + json_escape(cfg.arch) + "\","
+            "\"n_layers\":" + std::to_string(cfg.n_layers) + ","
+            "\"n_embd\":" + std::to_string(cfg.n_embd) + ","
+            "\"n_head\":" + std::to_string(cfg.n_head) + ","
+            "\"n_head_kv\":" + std::to_string(cfg.n_head_kv) + ","
+            "\"n_ctx\":" + std::to_string(cfg.n_ctx) + ","
+            "\"vocab_size\":" + std::to_string(cfg.vocab_size) + ","
+            "\"has_chat_template\":" + std::string(tokenizer->has_chat_template() ? "true" : "false") + ","
+            "\"chat_template_format\":\"" + json_escape(tokenizer->chat_template_format()) + "\"}";
+
+        std::string body_s;
+        if (path == "/v1/models") {
+            // OpenAI 兼容：{ "object":"list", "data":[ {...} ] }
+            body_s = "{\"object\":\"list\",\"data\":[" + info + "]}";
+        } else {
+            body_s = info;
         }
-        return json_get_string(body, "prompt");
+        std::string resp =
+            std::string("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n") + CORS_HEADERS +
+            "Content-Length: " + std::to_string(body_s.size()) +
+            "\r\nConnection: close\r\n\r\n" + body_s;
+        send_all(client_fd, resp);
+    }
+
+    // 静态文件托管：仅服务 web_root 下白名单路径，避免目录穿越
+    void handle_static(int client_fd, const std::string& path) {
+        if (web_root.empty()) {
+            std::string resp =
+                std::string("HTTP/1.1 404 Not Found\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(client_fd, resp);
+            return;
+        }
+        // 规整请求路径：/ -> index.html；/web/x -> x
+        std::string rel = (path == "/") ? "index.html" : path.substr(1);
+        if (rel.rfind("web/", 0) == 0) rel = rel.substr(4);
+        // 禁止路径穿越
+        if (rel.find("..") != std::string::npos) {
+            std::string resp =
+                std::string("HTTP/1.1 403 Forbidden\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(client_fd, resp);
+            return;
+        }
+        bool ok = false;
+        std::string body_s = read_file_all(web_root + "/" + rel, ok);
+        if (!ok) {
+            std::string resp =
+                std::string("HTTP/1.1 404 Not Found\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(client_fd, resp);
+            return;
+        }
+        std::string resp =
+            "HTTP/1.1 200 OK\r\nContent-Type: " + guess_mime(rel) + "\r\n" +
+            CORS_HEADERS +
+            "Content-Length: " + std::to_string(body_s.size()) +
+            "\r\nConnection: close\r\n\r\n" + body_s;
+        send_all(client_fd, resp);
+    }
+
+    // 从请求体中提取对话输入
+    struct ChatInput {
+        std::string system;  // system 消息（若存在）
+        std::string user;    // 最后一条 user 消息（主请求）
+        std::vector<std::pair<std::string, std::string>> history;  // 完整有序历史
+    };
+
+    ChatInput extract_chat(const std::string& body, const std::string& path) {
+        ChatInput ci;
+        if (path == "/v1/chat/completions") {
+            ci.history = parse_messages(body);
+            for (const auto& m : ci.history) {
+                if (m.first == "system" && ci.system.empty()) ci.system = m.second;
+                if (m.first == "user") ci.user = m.second;  // 取最后一条 user
+            }
+            // 兜底：若未解析到任何 user 消息，拼接所有 content
+            if (ci.user.empty()) {
+                for (const auto& m : ci.history)
+                    if (m.first != "system") ci.user += m.second + "\n";
+            }
+        } else {
+            ci.user = json_get_string(body, "prompt");
+        }
+        return ci;
     }
 
     void handle_generate(int client_fd, const std::string& body, const std::string& path) {
-        std::string prompt = extract_prompt(body, path);
+        ChatInput ci = extract_chat(body, path);
 
         // 解析采样参数
         SampleParams sp;
@@ -205,12 +379,24 @@ struct HttpServer::Impl {
         bool stream = false;
         json_get_bool(body, "stream", stream);
 
-        // 生成（加锁保护引擎）
+        // 生成（加锁保护引擎）。
+        // chat 模式下，若有多轮历史，拼接为 "user: xxx\nassistant: yyy\n..." 后交给模板，
+        // 以尽可能保留上下文（真正的多轮模板渲染需要 Jinja，当前为近似实现）。
+        std::string user_prompt = ci.user;
+        if (path == "/v1/chat/completions" && ci.history.size() > 1) {
+            std::string hist;
+            for (size_t i = 0; i + 1 < ci.history.size(); ++i) {
+                const auto& m = ci.history[i];
+                if (m.first == "system") continue;
+                hist += m.first + ": " + m.second + "\n";
+            }
+            if (!hist.empty()) user_prompt = hist + "user: " + ci.user;
+        }
         std::vector<int> ids;
         if (tokenizer->has_chat_template()) {
-            ids = tokenizer->apply_chat_template(prompt);
+            ids = tokenizer->apply_chat_template(user_prompt, ci.system);
         } else {
-            ids = tokenizer->encode(prompt, tokenizer->add_bos_token());
+            ids = tokenizer->encode(user_prompt, tokenizer->add_bos_token());
         }
 
         std::lock_guard<std::mutex> lock(engine_mtx);
@@ -224,7 +410,8 @@ struct HttpServer::Impl {
         if (stream) {
             // SSE 流式响应
             std::string head =
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n") +
+                CORS_HEADERS +
                 "Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
             send_all(client_fd, head);
 
@@ -253,12 +440,22 @@ struct HttpServer::Impl {
                 logits = engine->forward(next);
             }
 
-            std::string content =
-                "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
-                "\"choices\":[{\"text\":\"" + json_escape(full_text) +
-                "\",\"index\":0,\"finish_reason\":\"stop\"}]}";
+            // chat 模式下返回 OpenAI chat.completion 结构，便于前端复用
+            std::string content;
+            if (path == "/v1/chat/completions") {
+                content =
+                    "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\","
+                    "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\","
+                    "\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(full_text) +
+                    "\"}}]}";
+            } else {
+                content =
+                    "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
+                    "\"choices\":[{\"text\":\"" + json_escape(full_text) +
+                    "\",\"index\":0,\"finish_reason\":\"stop\"}]}";
+            }
             std::string resp =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                std::string("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n") + CORS_HEADERS +
                 "Content-Length: " + std::to_string(content.size()) +
                 "\r\nConnection: close\r\n\r\n" + content;
             send_all(client_fd, resp);
@@ -266,11 +463,20 @@ struct HttpServer::Impl {
     }
 };
 
-HttpServer::HttpServer(TransformerEngine& engine, Tokenizer& tokenizer, uint16_t port)
+HttpServer::HttpServer(TransformerEngine& engine, Tokenizer& tokenizer, uint16_t port,
+                       std::string model_path)
     : impl_(std::make_unique<Impl>()) {
     impl_->engine = &engine;
     impl_->tokenizer = &tokenizer;
     impl_->port = port;
+    impl_->model_path = std::move(model_path);
+    // 自动探测前端目录：优先 ./web；若 CLLM_WEB_ROOT 环境变量存在则使用之
+    if (const char* env = std::getenv("CLLM_WEB_ROOT")) {
+        impl_->web_root = env;
+    } else {
+        std::ifstream probe("web/index.html");
+        if (probe) impl_->web_root = "web";
+    }
 }
 
 HttpServer::~HttpServer() = default;

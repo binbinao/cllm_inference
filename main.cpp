@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
                   << ", heads: " << cfg.n_head
                   << " (kv: " << cfg.n_head_kv << ")\n"
                   << "  vocab: " << cfg.vocab_size
-                  << ", ctx: " << cfg.n_ctx << "\n";
+                  << ", ctx: " << cfg.n_ctx << "\n"
+                  << std::flush;
 
         cllm::ThreadPool pool(threads);
         cllm::TransformerEngine engine(model, pool);
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
         } else {
             // HTTP 服务
             std::cout << "Starting HTTP server on port " << port << " ...\n";
-            cllm::HttpServer server(engine, tokenizer, port);
+            cllm::HttpServer server(engine, tokenizer, port, model_path);
             server.start();
         }
     } catch (const std::exception& e) {

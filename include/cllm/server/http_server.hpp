@@ -14,7 +14,8 @@ namespace cllm {
 // 纯 C++ 标准库自研的 HTTP 推理服务器（OpenAI 兼容 + SSE 流式）
 class HttpServer {
 public:
-    HttpServer(TransformerEngine& engine, Tokenizer& tokenizer, uint16_t port);
+    HttpServer(TransformerEngine& engine, Tokenizer& tokenizer, uint16_t port,
+               std::string model_path = "");
     ~HttpServer();
 
     HttpServer(const HttpServer&) = delete;

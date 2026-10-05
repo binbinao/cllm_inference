@@ -16,6 +16,7 @@
 - **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
 - **多格式对话模板**：自动识别 ChatML（Qwen）/ Llama 3 / Llama 2·Mistral 并应用对应模板
 - **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
+- **内置 Web UI**：单文件 HTML 对话前端，支持流式输出、模型库浏览与启动命令生成（Qwen/Llama ≤30B）
 - **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 135 项断言，含吞吐基准
 
 ---
@@ -199,8 +200,12 @@ curl http://127.0.0.1:8080/v1/completions \
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
+| GET | `/v1/model/info` | 当前加载模型的元信息（架构、层数、上下文、模板格式） |
+| GET | `/v1/models` | OpenAI 兼容的模型列表（当前模型包装为 data 数组） |
 | POST | `/v1/completions` | 文本补全（`prompt` + 采样参数，支持 `stream`） |
-| POST | `/v1/chat/completions` | 对话补全（`messages` 数组，取 content 拼接） |
+| POST | `/v1/chat/completions` | 对话补全（`messages` 数组，返回 OpenAI chat.completion 结构） |
+| OPTIONS | `/*` | CORS 预检，允许所有源 |
+| GET | `/` 、`/web/*`、`/models.json` | 托管运行目录下 `web/` 前端静态资源（若存在） |
 
 ---
 
@@ -236,6 +241,34 @@ make bench
 
 ---
 
+## Web 对话界面
+
+内置一个**单文件前端**（`web/index.html`，纯 HTML/CSS/原生 JS，零构建、零依赖）。
+启动后浏览器访问服务端根路径即可进入对话模式：
+
+```bash
+./cllm_inference --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --port 8080
+# 打开 http://127.0.0.1:8080/
+```
+
+### 功能
+
+- **多轮对话**：对话历史在前端维护，每次请求完整传回后端
+- **SSE 流式输出**：字符逐 token 流式显示，支持中途中止
+- **当前模型展示**：从 `/v1/model/info` 读取架构、层数、上下文、模板格式
+- **模型库**：内置 Qwen 2.5 / Qwen 3 / Llama 3.1 / Llama 3.2 的 GGUF 清单（均 ≤30B）
+  —— 点击模型弹出**下载 + 启动命令**。
+- **采样参数调节**：温度、top-p、top-k、最大 tokens 在输入区下方实时可调
+
+### 说明
+
+- 模型切换采用「重启」方式：前端仅展示启动命令，执行方需在终端 `Ctrl+C` 停掉当前进程后
+  用新的 `--model` 重新启动。这是有意为之的设计——运行期热切换模型在单进程下易导致内存波动与卡顿。
+- 模型文件本身**不**纳入版本控制，请按前端弹出的 `curl` 命令自行下载到 `models/` 目录。
+- 如需自定义前端目录，设置环境变量 `CLLM_WEB_ROOT=/path/to/web` 后启动。
+
+---
+
 ## 项目结构
 
 ```
@@ -249,10 +282,13 @@ cllm_inference/
 ├── src/
 │   ├── core/               # 引擎核心实现
 │   └── server/             # HTTP 服务实现
-└── tests/                  # 单元测试与基准
-    ├── quant_test.cpp      # 13 种量化反量化 + matmul_quant
-    ├── threadpool_test.cpp # 线程池并行一致性
-    ├── sampler_test.cpp    # 采样器行为
-    ├── bench.cpp           # 量化内核吞吐基准
-    └── run_tests.sh        # 一键运行
+├── tests/                  # 单元测试与基准
+│   ├── quant_test.cpp      # 13 种量化反量化 + matmul_quant
+│   ├── threadpool_test.cpp # 线程池并行一致性
+│   ├── sampler_test.cpp    # 采样器行为
+│   ├── bench.cpp           # 量化内核吞吐基准
+│   └── run_tests.sh        # 一键运行
+└── web/                    # 单文件前端（HTTP 服务自动托管）
+    ├── index.html          # 对话界面 + 模型库 + SSE 流式
+    └── models.json         # Qwen / Llama ≤30B 的 GGUF 清单
 ```

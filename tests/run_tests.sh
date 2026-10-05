@@ -21,6 +21,7 @@ run_case() {
 
 run_case quant_test src/core/quant.cpp src/core/thread_pool.cpp
 run_case threadpool_test src/core/thread_pool.cpp
+run_case threadpool_stress_test src/core/thread_pool.cpp
 run_case sampler_test src/core/sampler.cpp
 
 if [[ "${1:-}" == "--bench" ]]; then

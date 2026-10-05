@@ -31,6 +31,9 @@ if(CLLM_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(threadpool_test tests/threadpool_test.cpp)
     target_link_libraries(threadpool_test PRIVATE cllm_core Threads::Threads)
 
+    add_executable(threadpool_stress_test tests/threadpool_stress_test.cpp)
+    target_link_libraries(threadpool_stress_test PRIVATE cllm_core Threads::Threads)
+
     add_executable(sampler_test tests/sampler_test.cpp)
     target_link_libraries(sampler_test PRIVATE cllm_core Threads::Threads)
 
@@ -39,6 +42,7 @@ if(CLLM_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
     add_test(NAME quant      COMMAND quant_test)
     add_test(NAME threadpool COMMAND threadpool_test)
+    add_test(NAME threadpool_stress COMMAND threadpool_stress_test)
     add_test(NAME sampler    COMMAND sampler_test)
 endif()
 
