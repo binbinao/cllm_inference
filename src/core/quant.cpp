@@ -1,5 +1,6 @@
 #include "cllm/core/quant.hpp"
 #include "cllm/core/tensor.hpp"
+#include "cllm/core/thread_pool.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -62,18 +63,17 @@ void deq_q8_0(const void* src, float* dst, int64_t n) {
 }
 
 // ---- Q4_0 : block = [d:f16][qs:16B 打包 32 个 nibble]，value = d * (q - 8) ----
+// qs[j] 低 nibble = 元素 j（0-15），高 nibble = 元素 j+16（16-31）
 void deq_q4_0(const void* src, float* dst, int64_t n) {
     const uint8_t* s = static_cast<const uint8_t*>(src);
     const int bs = 32;
     for (int64_t i = 0; i < n; i += bs) {
         float d = half_to_float(*reinterpret_cast<const uint16_t*>(s));
         s += 2;
-        for (int j = 0; j < bs / 2 && i + j * 2 < n; ++j) {
+        for (int j = 0; j < bs / 2; ++j) {
             uint8_t byte = s[j];
-            int q0 = byte & 0xF;
-            int q1 = byte >> 4;
-            if (i + j * 2 < n)     dst[i + j * 2]     = d * (q0 - 8);
-            if (i + j * 2 + 1 < n) dst[i + j * 2 + 1] = d * (q1 - 8);
+            if (i + j < n)      dst[i + j]      = d * ((byte & 0xF) - 8);
+            if (i + j + 16 < n) dst[i + j + 16] = d * ((byte >> 4) - 8);
         }
         s += bs / 2;
     }
@@ -172,6 +172,181 @@ void deq_q6_k(const void* src, float* dst, int64_t n) {
     }
 }
 
+// ---- Q4_1 : block = [d:f16][m:f16][qs:16B 打包 32 个 nibble]，value = d * q + m ----
+void deq_q4_1(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int bs = 32;
+    for (int64_t i = 0; i < n; i += bs) {
+        float d = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        float m = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        for (int j = 0; j < bs / 2; ++j) {
+            uint8_t byte = s[j];
+            if (i + j < n)      dst[i + j]      = d * (byte & 0xF) + m;
+            if (i + j + 16 < n) dst[i + j + 16] = d * (byte >> 4) + m;
+        }
+        s += bs / 2;
+    }
+}
+
+// ---- Q5_1 : block = [d:f16][m:f16][qh:4B 高1位][qs:16B 低4位]，value = d * q + m ----
+// qs[j] 低 nibble = 元素 j，高 nibble = 元素 j+16；qh 第 j 位 = 元素 j 的高 1 位
+void deq_q5_1(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int bs = 32;
+    for (int64_t i = 0; i < n; i += bs) {
+        float d = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        float m = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        const uint8_t* qh = s; s += 4;
+        const uint8_t* qs = s; s += 16;
+        uint32_t qh_bits = (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) |
+                           ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
+        for (int j = 0; j < 16; ++j) {
+            int hi0 = (qh_bits >> j) & 1;
+            int hi1 = (qh_bits >> (j + 16)) & 1;
+            int q0 = (qs[j] & 0xF) | (hi0 << 4);
+            int q1 = (qs[j] >> 4) | (hi1 << 4);
+            if (i + j < n)      dst[i + j]      = d * q0 + m;
+            if (i + j + 16 < n) dst[i + j + 16] = d * q1 + m;
+        }
+    }
+}
+
+// ---- Q8_1 : block = [d:f16][s:f16][qs:32 x int8]，value = d * q（s 仅用于点积）----
+void deq_q8_1(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int bs = 32;
+    for (int64_t i = 0; i < n; i += bs) {
+        float d = half_to_float(*reinterpret_cast<const uint16_t*>(s));
+        s += 4;  // 跳过 d 与 s 两个 f16
+        for (int j = 0; j < bs && i + j < n; ++j) {
+            dst[i + j] = d * static_cast<int8_t>(s[j]);
+        }
+        s += bs;
+    }
+}
+
+// ---- Q2_K : super block(256) = [scales:16B][qs:64B][d:f16][dmin:f16] ----
+// 每字节 scale = [sc:低4位][m:高4位]，value = d*sc*q - dmin*m，q 为 2 bit
+void deq_q2_k(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int QK = 256;
+    for (int64_t i = 0; i < n; i += QK) {
+        const uint8_t* scales = s; s += QK / 16;  // 16 字节
+        const uint8_t* q = s;      s += QK / 4;   // 64 字节
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+
+        int is = 0;
+        for (int nb = 0; nb < QK; nb += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = scales[is++];
+                float dl = d * (sc & 0xF);
+                float ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    if (i + nb + j * 32 + l < n)
+                        dst[i + nb + j * 32 + l] = dl * ((q[l] >> shift) & 3) - ml;
+                }
+                sc = scales[is++];
+                dl = d * (sc & 0xF);
+                ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    if (i + nb + j * 32 + 16 + l < n)
+                        dst[i + nb + j * 32 + 16 + l] = dl * ((q[l + 16] >> shift) & 3) - ml;
+                }
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+// ---- Q3_K : super block(256) = [hmask:32B][qs:64B][scales:12B][d:f16] ----
+// 6 bit scale(交错打包) - 32；q 为 2 bit 减去 hmask 提供的高位
+void deq_q3_k(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int QK = 256;
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    for (int64_t i = 0; i < n; i += QK) {
+        const uint8_t* hm = s; s += QK / 8;   // 32 字节
+        const uint8_t* q  = s; s += QK / 4;   // 64 字节
+        uint32_t aux[4];
+        std::memcpy(aux, s, 12);
+        s += 12;
+        const float d_all = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+
+        // 12 字节交错打包的 6 bit scales 解包（见 llama.cpp dequantize_row_q3_K）
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+
+        int is = 0;
+        uint8_t m = 1;
+        for (int nb = 0; nb < QK; nb += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = i + nb + j * 32 + l;
+                    if (idx < n)
+                        dst[idx] = dl * (((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                }
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = i + nb + j * 32 + 16 + l;
+                    if (idx < n)
+                        dst[idx] = dl * (((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
+// ---- Q5_K : super block(256) = [d:f16][dmin:f16][scales:12B][qh:32B][qs:128B] ----
+// 低 4 位在 qs，高 1 位在 qh（每 64 元素换一个 bit 位），value = d*sc*q - dmin*m
+void deq_q5_k(const void* src, float* dst, int64_t n) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const int QK = 256;
+    for (int64_t i = 0; i < n; i += QK) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(s)); s += 2;
+        const uint8_t* scales = s; s += 12;
+        const uint8_t* qh = s; s += QK / 8;   // 32 字节
+        const uint8_t* ql = s; s += QK / 2;   // 128 字节
+
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m);
+            float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m);
+            float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; ++l) {
+                int idx = i + j + l;
+                if (idx < n)
+                    dst[idx] = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            }
+            for (int l = 0; l < 32; ++l) {
+                int idx = i + j + 32 + l;
+                if (idx < n)
+                    dst[idx] = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            }
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
 }  // namespace
 
 int block_size(GgmlType type) {
@@ -210,9 +385,15 @@ void dequantize_block(const void* src, float* dst, GgmlType type, int64_t n) {
         case GgmlType::F32:  deq_f32(src, dst, n); break;
         case GgmlType::F16:  deq_f16(src, dst, n); break;
         case GgmlType::Q8_0: deq_q8_0(src, dst, n); break;
+        case GgmlType::Q8_1: deq_q8_1(src, dst, n); break;
         case GgmlType::Q4_0: deq_q4_0(src, dst, n); break;
+        case GgmlType::Q4_1: deq_q4_1(src, dst, n); break;
         case GgmlType::Q5_0: deq_q5_0(src, dst, n); break;
+        case GgmlType::Q5_1: deq_q5_1(src, dst, n); break;
+        case GgmlType::Q2_K: deq_q2_k(src, dst, n); break;
+        case GgmlType::Q3_K: deq_q3_k(src, dst, n); break;
         case GgmlType::Q4_K: deq_q4_k(src, dst, n); break;
+        case GgmlType::Q5_K: deq_q5_k(src, dst, n); break;
         case GgmlType::Q6_K: deq_q6_k(src, dst, n); break;
         default:
             throw std::runtime_error("unsupported ggml type for dequantize");
@@ -223,6 +404,44 @@ std::vector<float> Tensor::dequantize() const {
     std::vector<float> out(numel());
     dequantize_block(data, out.data(), type, static_cast<int64_t>(numel()));
     return out;
+}
+
+void matmul_quant(const float* x, const void* w, GgmlType type,
+                  const float* bias, int in_dim, int out_dim, float* y,
+                  ThreadPool* pool) {
+    const int bs = block_size(type);
+    if (bs <= 0 || in_dim % bs != 0) {
+        throw std::runtime_error("matmul_quant: in_dim not divisible by block size");
+    }
+    const size_t row_bytes = (size_t)(in_dim / bs) * type_size(type);
+    const uint8_t* base = static_cast<const uint8_t*>(w);
+
+    // 分块融合：按 cache 友好的粒度反量化并立即累加，避免整行 float 缓冲的完整往返。
+    // 块长对齐到该类型的 block size。
+    const int CHUNK = 512;
+    const int chunk_len = (CHUNK / bs) * bs;
+    auto row_dot = [&](std::vector<float>& buf, int j) {
+        const uint8_t* rp = base + (size_t)j * row_bytes;
+        float acc = bias ? bias[j] : 0.0f;
+        for (int off = 0; off < in_dim; off += chunk_len) {
+            const int len = std::min(chunk_len, in_dim - off);
+            dequantize_block(rp + (size_t)(off / bs) * type_size(type), buf.data(), type, len);
+            const float* xp = x + off;
+            for (int i = 0; i < len; ++i) acc += xp[i] * buf[i];
+        }
+        y[j] = acc;
+    };
+
+    // 大矩阵走线程池并行（每个任务块复用自己的行缓冲）
+    if (pool && out_dim >= 256) {
+        pool->parallel_for(0, (size_t)out_dim, [&](size_t b, size_t e) {
+            std::vector<float> buf(chunk_len);
+            for (size_t j = b; j < e; ++j) row_dot(buf, (int)j);
+        });
+    } else {
+        std::vector<float> buf(chunk_len);
+        for (int j = 0; j < out_dim; ++j) row_dot(buf, j);
+    }
 }
 
 }  // namespace cllm

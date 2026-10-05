@@ -89,6 +89,14 @@ Tokenizer::Tokenizer(const GgufModel& model)
     is_gpt2_ = (model.tokenizer_model == "gpt2");
     add_bos_token_ = model.add_bos_token;
     has_chat_template_ = !model.chat_template.empty();
+    chat_template_ = model.chat_template;
+    // 记录识别到的模板格式（用于诊断）
+    if (!chat_template_.empty()) {
+        if (chat_template_.find("<|im_start|>") != std::string::npos) chat_template_format_ = "chatml";
+        else if (chat_template_.find("<|start_header_id|>") != std::string::npos) chat_template_format_ = "llama3";
+        else if (chat_template_.find("[INST]") != std::string::npos) chat_template_format_ = "llama2";
+        else chat_template_format_ = "unknown";
+    }
     // BPE 合并排名：rank = 索引（越靠前优先级越高）
     for (size_t i = 0; i < model.merges.size(); ++i) {
         merges_rank_[model.merges[i]] = (int)i;
@@ -97,41 +105,63 @@ Tokenizer::Tokenizer(const GgufModel& model)
 
 std::vector<int> Tokenizer::apply_chat_template(const std::string& user_message,
                                                 const std::string& system_message) const {
+    // 依据词表中实际存在的特殊 token 分派模板格式，避免仅支持单一格式导致静默退化。
     const int im_start = find_token("<|im_start|>");
-    const int im_end = find_token("<|im_end|>");
-
-    // 无 Qwen 特殊 token 时回退为普通编码
-    if (im_start < 0 || im_end < 0) {
-        return encode(user_message, add_bos_token_);
-    }
+    const int im_end   = find_token("<|im_end|>");
 
     // 换行与普通文本一律走 encode，避免 bytes_to_unicode 映射差异
-    std::vector<int> ids;
-    auto push_text = [&](const std::string& text) {
+    auto push_text = [&](std::vector<int>& ids, const std::string& text) {
         auto part = encode(text, false);
         ids.insert(ids.end(), part.begin(), part.end());
     };
 
-    // 默认 system prompt（Qwen 系列）
-    std::string sys = system_message;
-    if (sys.empty()) {
-        sys = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+    // ---- 格式 1：ChatML（Qwen 系列）----
+    if (im_start >= 0 && im_end >= 0) {
+        std::string sys = system_message;
+        if (sys.empty()) {
+            sys = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+        }
+        std::vector<int> ids;
+        ids.push_back(im_start); push_text(ids, "system\n" + sys); ids.push_back(im_end); push_text(ids, "\n");
+        ids.push_back(im_start); push_text(ids, "user\n" + user_message); ids.push_back(im_end); push_text(ids, "\n");
+        ids.push_back(im_start); push_text(ids, "assistant\n");
+        return ids;
     }
 
-    ids.push_back(im_start);
-    push_text("system\n" + sys);
-    ids.push_back(im_end);
-    push_text("\n");
+    // ---- 格式 2：Llama 3（<|start_header_id|>role<|end_header_id|>\n\n...<|eot_id|>）----
+    const int sh = find_token("<|start_header_id|>");
+    const int eh = find_token("<|end_header_id|>");
+    const int eot = find_token("<|eot_id|>");
+    if (sh >= 0 && eh >= 0 && eot >= 0) {
+        std::vector<int> ids;
+        auto header = [&](const std::string& role) {
+            ids.push_back(sh);
+            push_text(ids, role);
+            ids.push_back(eh);
+            push_text(ids, "\n\n");
+        };
+        const int bot = find_token("<|begin_of_text|>");
+        if (bot >= 0) ids.push_back(bot);
+        if (!system_message.empty()) { header("system"); push_text(ids, system_message); ids.push_back(eot); }
+        header("user"); push_text(ids, user_message); ids.push_back(eot);
+        header("assistant");
+        return ids;
+    }
 
-    ids.push_back(im_start);
-    push_text("user\n" + user_message);
-    ids.push_back(im_end);
-    push_text("\n");
+    // ---- 格式 3：Llama 2 / Mistral（[INST] ... [/INST]）----
+    const int binst = find_token("[INST]");
+    if (binst >= 0 && find_token("[/INST]") >= 0) {
+        std::vector<int> ids;
+        if (bos_id_ >= 0 && add_bos_token_) ids.push_back(bos_id_);
+        ids.push_back(binst);
+        if (!system_message.empty()) push_text(ids, " " + system_message + " ");
+        push_text(ids, user_message);
+        push_text(ids, " [/INST]");
+        return ids;
+    }
 
-    ids.push_back(im_start);
-    push_text("assistant\n");
-
-    return ids;
+    // ---- 回退：无已知模板格式时按普通文本编码 ----
+    return encode(user_message, add_bos_token_);
 }
 
 int Tokenizer::find_token(const std::string& s) const {

@@ -9,12 +9,14 @@
 
 - **纯 C++20 / 零依赖**：仅依赖标准库与 POSIX 系统调用，无任何第三方库
 - **完整 GGUF 解析**：支持 GGUF v2/v3，mmap 零拷贝加载
-- **量化反量化**：支持 F32 / F16 / Q8_0 / Q5_0 / Q4_K / Q6_K 等 GGML 量化格式
+- **量化类型全覆盖**：支持 F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K 共 13 种 GGML 量化格式
+- **零拷贝量化推理**：量化权重直接引用 mmap 数据，按输出行惰性反量化，无需加载期全量展开为 float32（0.5B Q4_K_M 常驻内存 ~430MB）
 - **通用 Transformer 内核**：RMSNorm、NEOX RoPE、GQA Attention、SwiGLU FFN、KV Cache
 - **CPU 多线程**：手写线程池，按行/分块并行矩阵乘
 - **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
-- **对话模板**：自动识别 Qwen 等 chat 模型并应用 `<|im_start|>` 对话模板
+- **多格式对话模板**：自动识别 ChatML（Qwen）/ Llama 3 / Llama 2·Mistral 并应用对应模板
 - **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
+- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 135 项断言，含吞吐基准
 
 ---
 
@@ -207,9 +209,30 @@ curl http://127.0.0.1:8080/v1/completions \
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `missing tensor: blk.N.xxx` | 模型张量命名与当前支持架构不匹配 | 换用 qwen2/llama 架构的 GGUF |
-| `unsupported ggml type` | 模型含未实现的量化类型 | 换用 Q4_K_M / Q5 等已支持量化 |
-| 输出乱码 | 模型为 chat 模型但未走对话模板 | 确认模型含 `tokenizer.chat_template` |
-| 加载缓慢 | 首次全量反量化权重到内存 | 属预期，Q4_K_M 约需数 GB 内存 |
+| `unsupported ggml type` | 模型含未实现的量化类型 | 已支持 13 种常用类型；如遇新类型需扩展 `quant.cpp` |
+| `in_dim not divisible by block size` | 张量内维与量化 block 不整除 | 该类模型罕见，通常是转换异常 |
+| 输出乱码 | 模型为 chat 模型但未走对话模板 | 确认模型含 `tokenizer.chat_template`；支持 ChatML / Llama3 / Llama2 |
+| 内存占用 | 量化权重按需反量化 | 0.5B Q4_K_M 约 430MB（相比全量反量化缓存的 ~3GB 大幅下降） |
+
+> 说明：当前量化内核为**标量惰性反量化**实现，主要收益是**内存**而非吞吐；
+> 若需吞吐加速，后续可引入 SIMD 整数点积后端（见 `tests/bench.cpp` 基准数据）。
+
+---
+
+## 测试与基准
+
+```bash
+# 运行全部单元测试（量化 / 线程池 / 采样器）
+make test
+
+# 追加运行量化矩阵乘吞吐基准
+make bench
+```
+
+- **覆盖范围**：13 种 GGML 量化类型反量化、`matmul_quant` 内核（与 float 参考逐元素比对）、
+  线程池并行一致性、采样器 greedy/top-k/top-p/温度行为，共 **135 项断言**。
+- **基准**：`tests/bench.cpp` 报告各量化类型的 GFLOP/s 及相对纯 float matmul 的比值。
+- CMake 构建下：`cmake --build build && ctest --test-dir build`。
 
 ---
 
@@ -217,13 +240,19 @@ curl http://127.0.0.1:8080/v1/completions \
 
 ```
 cllm_inference/
-├── CMakeLists.txt          # CMake 构建配置（含 install 规则）
-├── Makefile                # Make 构建配置（推荐）
+├── CMakeLists.txt          # CMake 构建配置（含 install / test 目标）
+├── Makefile                # Make 构建配置（含 make test / bench）
 ├── main.cpp                # CLI + HTTP 双入口
 ├── include/cllm/
 │   ├── core/               # 引擎核心头文件（gguf/engine/quant/sampler/...）
 │   └── server/             # HTTP 服务头文件
-└── src/
-    ├── core/               # 引擎核心实现
-    └── server/             # HTTP 服务实现
+├── src/
+│   ├── core/               # 引擎核心实现
+│   └── server/             # HTTP 服务实现
+└── tests/                  # 单元测试与基准
+    ├── quant_test.cpp      # 13 种量化反量化 + matmul_quant
+    ├── threadpool_test.cpp # 线程池并行一致性
+    ├── sampler_test.cpp    # 采样器行为
+    ├── bench.cpp           # 量化内核吞吐基准
+    └── run_tests.sh        # 一键运行
 ```

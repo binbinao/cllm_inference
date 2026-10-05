@@ -27,5 +27,8 @@ cmake-build-*/
 # archify 架构图工具产物（本地生成，不纳入版本控制）
 /.archify/
 
+# 工具记忆目录（本地生成）
+/.workbuddy/
+
 # macOS
 .DS_Store

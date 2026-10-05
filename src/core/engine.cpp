@@ -13,29 +13,6 @@ namespace {
 
 // ---- 基础算子 ----
 
-// x[1,in] @ W[out,in]^T -> y[1,out]
-void matmul(const std::vector<float>& x, const std::vector<float>& W,
-            int in_dim, int out_dim, std::vector<float>& y, ThreadPool* pool) {
-    y.assign(out_dim, 0.0f);
-    if (pool && out_dim >= 1024) {
-        pool->parallel_for(0, (size_t)out_dim, [&](size_t b, size_t e) {
-            for (size_t j = b; j < e; ++j) {
-                const float* wr = W.data() + j * in_dim;
-                float s = 0.0f;
-                for (int i = 0; i < in_dim; ++i) s += x[i] * wr[i];
-                y[j] = s;
-            }
-        });
-    } else {
-        for (int j = 0; j < out_dim; ++j) {
-            const float* wr = W.data() + j * in_dim;
-            float s = 0.0f;
-            for (int i = 0; i < in_dim; ++i) s += x[i] * wr[i];
-            y[j] = s;
-        }
-    }
-}
-
 // RMSNorm：out = x / rms(x) * w
 void rms_norm(const std::vector<float>& x, const std::vector<float>& w,
               float eps, std::vector<float>& out) {
@@ -105,14 +82,20 @@ void attention(const std::vector<float>& q,
 struct TransformerEngine::Impl {
     ModelConfig cfg;
     ThreadPool* pool = nullptr;
+    const GgufModel* model = nullptr;   // 持有模型引用（数据来自其 mmap 区域）
 
-    // 反量化后的权重缓存（float32）
-    std::unordered_map<std::string, std::vector<float>> W;
+    // 量化线性权重：直接引用 mmap 中数据，零拷贝，不常驻 float
+    struct QuantWeight {
+        const void* data = nullptr;
+        GgmlType type = GgmlType::F32;
+        int out_dim = 0;
+        int in_dim = 0;
+    };
+    std::unordered_map<std::string, QuantWeight> QW;
+    // norm 权重（量级小，反量化为 float 供 rms_norm 使用）
+    std::unordered_map<std::string, std::vector<float>> NW;
     // bias 缓存（可选，Qwen2 等架构的 qkv 投影带 bias）
     std::unordered_map<std::string, std::vector<float>> B;
-    // 记录每个线性权重矩阵的 out/in 维
-    struct WeightMeta { int out_dim = 0; int in_dim = 0; };
-    std::unordered_map<std::string, WeightMeta> meta;
 
     // KV Cache：每层 [seq * n_head_kv * head_dim]
     std::vector<std::vector<float>> k_cache;
@@ -121,14 +104,24 @@ struct TransformerEngine::Impl {
 
     int n_embd = 0, n_head = 0, n_head_kv = 0, head_dim = 0;
 
-    void load_tensor(const GgufModel& model, const std::string& name,
+    // 加载量化线性权重（记录类型与形状，数据零拷贝指向 mmap）
+    void load_weight(const GgufModel& model, const std::string& name,
                      int out_dim, int in_dim) {
         auto it = model.tensors.find(name);
         if (it == model.tensors.end()) {
             throw std::runtime_error("missing tensor: " + name);
         }
-        W[name] = it->second.dequantize();
-        meta[name] = {out_dim, in_dim};
+        QW[name] = {it->second.data, it->second.type, out_dim, in_dim};
+    }
+
+    // 加载并反量化一维 norm 权重为 float
+    void load_norm(const GgufModel& model, const std::string& name, int n) {
+        auto it = model.tensors.find(name);
+        if (it == model.tensors.end()) {
+            throw std::runtime_error("missing tensor: " + name);
+        }
+        NW[name] = it->second.dequantize();
+        (void)n;
     }
 
     // 可选加载 bias（不存在则跳过，返回是否加载成功）
@@ -138,12 +131,35 @@ struct TransformerEngine::Impl {
         B[name] = it->second.dequantize();
         return true;
     }
+
+    // 量化权重矩阵乘：y = x · Wᵀ (+ bias)，按输出行惰性反量化 + 并行
+    void mm(const std::string& w_name, const std::string& b_name,
+            const std::vector<float>& x, std::vector<float>& y) {
+        const auto& w = QW.at(w_name);
+        const std::vector<float>* b = nullptr;
+        auto it = B.find(b_name);
+        if (it != B.end()) b = &it->second;
+        y.assign(w.out_dim, 0.0f);
+        matmul_quant(x.data(), w.data, w.type, b ? b->data() : nullptr,
+                     w.in_dim, w.out_dim, y.data(), pool);
+    }
+
+    // 取 embedding 矩阵第 token 行并反量化为 float（embedding 本身也可能是量化类型）
+    void get_embedding(int token, std::vector<float>& x) {
+        const auto& w = QW.at("token_embd.weight");
+        const int bs = block_size(w.type);
+        const size_t row_bytes = (size_t)(w.in_dim / bs) * type_size(w.type);
+        const uint8_t* base = static_cast<const uint8_t*>(w.data);
+        x.resize(w.in_dim);
+        dequantize_block(base + (size_t)token * row_bytes, x.data(), w.type, w.in_dim);
+    }
 };
 
 TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
     : impl_(std::make_unique<Impl>()) {
     auto& c = impl_->cfg = model.config;
     impl_->pool = &pool;
+    impl_->model = &model;
     impl_->n_embd = c.n_embd;
     impl_->n_head = c.n_head;
     impl_->n_head_kv = c.n_head_kv;
@@ -151,16 +167,15 @@ TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
 
     if (c.arch.empty()) throw std::runtime_error("unknown architecture (missing general.architecture)");
 
-    // 加载 embedding 与输出
-    impl_->load_tensor(model, "token_embd.weight", c.vocab_size, c.n_embd);
+    // 加载 embedding 与输出（线性权重零拷贝引用 mmap，不常驻 float）
+    impl_->load_weight(model, "token_embd.weight", c.vocab_size, c.n_embd);
     // 输出层可能共享 embedding（tied）
     if (model.tensors.count("output.weight")) {
-        impl_->load_tensor(model, "output.weight", c.vocab_size, c.n_embd);
+        impl_->load_weight(model, "output.weight", c.vocab_size, c.n_embd);
     } else {
-        impl_->W["output.weight"] = impl_->W["token_embd.weight"];
-        impl_->meta["output.weight"] = {(int)c.vocab_size, (int)c.n_embd};
+        impl_->QW["output.weight"] = impl_->QW["token_embd.weight"];
     }
-    impl_->load_tensor(model, "output_norm.weight", c.n_embd, 1);
+    impl_->load_norm(model, "output_norm.weight", c.n_embd);
 
     // 每层权重
     impl_->k_cache.resize(c.n_layers);
@@ -168,18 +183,18 @@ TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
     int kv_dim = c.n_head_kv * impl_->head_dim;
     for (uint32_t l = 0; l < c.n_layers; ++l) {
         std::string p = "blk." + std::to_string(l) + ".";
-        impl_->load_tensor(model, p + "attn_norm.weight", c.n_embd, 1);
-        impl_->load_tensor(model, p + "attn_q.weight", c.n_embd, c.n_embd);
-        impl_->load_tensor(model, p + "attn_k.weight", kv_dim, c.n_embd);
-        impl_->load_tensor(model, p + "attn_v.weight", kv_dim, c.n_embd);
+        impl_->load_norm(model, p + "attn_norm.weight", c.n_embd);
+        impl_->load_weight(model, p + "attn_q.weight", c.n_embd, c.n_embd);
+        impl_->load_weight(model, p + "attn_k.weight", kv_dim, c.n_embd);
+        impl_->load_weight(model, p + "attn_v.weight", kv_dim, c.n_embd);
         impl_->load_bias(model, p + "attn_q.bias");
         impl_->load_bias(model, p + "attn_k.bias");
         impl_->load_bias(model, p + "attn_v.bias");
-        impl_->load_tensor(model, p + "attn_output.weight", c.n_embd, c.n_embd);
-        impl_->load_tensor(model, p + "ffn_norm.weight", c.n_embd, 1);
-        impl_->load_tensor(model, p + "ffn_gate.weight", c.n_ff, c.n_embd);
-        impl_->load_tensor(model, p + "ffn_up.weight", c.n_ff, c.n_embd);
-        impl_->load_tensor(model, p + "ffn_down.weight", c.n_embd, c.n_ff);
+        impl_->load_weight(model, p + "attn_output.weight", c.n_embd, c.n_embd);
+        impl_->load_norm(model, p + "ffn_norm.weight", c.n_embd);
+        impl_->load_weight(model, p + "ffn_gate.weight", c.n_ff, c.n_embd);
+        impl_->load_weight(model, p + "ffn_up.weight", c.n_ff, c.n_embd);
+        impl_->load_weight(model, p + "ffn_down.weight", c.n_embd, c.n_ff);
     }
 }
 
@@ -200,12 +215,10 @@ std::vector<float> TransformerEngine::forward(int token) {
     auto& I = *impl_;
     auto& c = I.cfg;
     int n_embd = I.n_embd, head_dim = I.head_dim;
-    int kv_dim = I.n_head_kv * head_dim;
 
-    // embedding
-    const auto& emb = I.W["token_embd.weight"];
-    std::vector<float> x(emb.begin() + (size_t)token * n_embd,
-                         emb.begin() + (size_t)(token + 1) * n_embd);
+    // embedding：反量化第 token 行
+    std::vector<float> x;
+    I.get_embedding(token, x);
 
     std::vector<float> h, q, k, v, attn_out, h2, gate, up, down, tmp;
 
@@ -213,17 +226,11 @@ std::vector<float> TransformerEngine::forward(int token) {
         std::string p = "blk." + std::to_string(l) + ".";
 
         // ---- attention ----
-        rms_norm(x, I.W[p + "attn_norm.weight"], c.norm_eps, h);
-        matmul(h, I.W[p + "attn_q.weight"], n_embd, n_embd, q, I.pool);
-        matmul(h, I.W[p + "attn_k.weight"], n_embd, kv_dim, k, I.pool);
-        matmul(h, I.W[p + "attn_v.weight"], n_embd, kv_dim, v, I.pool);
-        // 加 qkv 投影 bias（Qwen2 等架构带 bias，llama 无则跳过）
-        if (auto it = I.B.find(p + "attn_q.bias"); it != I.B.end())
-            for (int i = 0; i < n_embd; ++i) q[i] += it->second[i];
-        if (auto it = I.B.find(p + "attn_k.bias"); it != I.B.end())
-            for (int i = 0; i < kv_dim; ++i) k[i] += it->second[i];
-        if (auto it = I.B.find(p + "attn_v.bias"); it != I.B.end())
-            for (int i = 0; i < kv_dim; ++i) v[i] += it->second[i];
+        rms_norm(x, I.NW[p + "attn_norm.weight"], c.norm_eps, h);
+        // 量化权重矩阵乘（bias 在 mm 内直接加入）
+        I.mm(p + "attn_q.weight", p + "attn_q.bias", h, q);
+        I.mm(p + "attn_k.weight", p + "attn_k.bias", h, k);
+        I.mm(p + "attn_v.weight", p + "attn_v.bias", h, v);
 
         int pos = I.seq_len;
         apply_rope(q.data(), I.n_head, head_dim, pos, c.rope_theta);
@@ -236,22 +243,22 @@ std::vector<float> TransformerEngine::forward(int token) {
         vc.insert(vc.end(), v.begin(), v.end());
 
         attention(q, kc, vc, I.seq_len + 1, I.n_head, I.n_head_kv, head_dim, attn_out);
-        matmul(attn_out, I.W[p + "attn_output.weight"], n_embd, n_embd, tmp, I.pool);
+        I.mm(p + "attn_output.weight", "", attn_out, tmp);
         for (int i = 0; i < n_embd; ++i) x[i] += tmp[i];
 
         // ---- FFN (SwiGLU) ----
-        rms_norm(x, I.W[p + "ffn_norm.weight"], c.norm_eps, h2);
-        matmul(h2, I.W[p + "ffn_gate.weight"], n_embd, c.n_ff, gate, I.pool);
-        matmul(h2, I.W[p + "ffn_up.weight"], n_embd, c.n_ff, up, I.pool);
+        rms_norm(x, I.NW[p + "ffn_norm.weight"], c.norm_eps, h2);
+        I.mm(p + "ffn_gate.weight", "", h2, gate);
+        I.mm(p + "ffn_up.weight", "", h2, up);
         for (int i = 0; i < (int)c.n_ff; ++i) gate[i] = silu(gate[i]) * up[i];
-        matmul(gate, I.W[p + "ffn_down.weight"], c.n_ff, n_embd, down, I.pool);
+        I.mm(p + "ffn_down.weight", "", gate, down);
         for (int i = 0; i < n_embd; ++i) x[i] += down[i];
     }
 
     // ---- 输出层 ----
-    rms_norm(x, I.W["output_norm.weight"], c.norm_eps, h);
+    rms_norm(x, I.NW["output_norm.weight"], c.norm_eps, h);
     std::vector<float> logits;
-    matmul(h, I.W["output.weight"], n_embd, c.vocab_size, logits, I.pool);
+    I.mm("output.weight", "", h, logits);
 
     ++I.seq_len;
     return logits;

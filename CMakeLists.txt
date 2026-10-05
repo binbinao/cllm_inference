@@ -19,6 +19,29 @@ target_link_libraries(cllm_inference PRIVATE cllm_core)
 find_package(Threads REQUIRED)
 target_link_libraries(cllm_inference PRIVATE Threads::Threads)
 
+# ---- 测试与基准 ----
+option(CLLM_BUILD_TESTS "Build tests and benchmark" ON)
+
+if(CLLM_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    enable_testing()
+
+    add_executable(quant_test tests/quant_test.cpp)
+    target_link_libraries(quant_test PRIVATE cllm_core Threads::Threads)
+
+    add_executable(threadpool_test tests/threadpool_test.cpp)
+    target_link_libraries(threadpool_test PRIVATE cllm_core Threads::Threads)
+
+    add_executable(sampler_test tests/sampler_test.cpp)
+    target_link_libraries(sampler_test PRIVATE cllm_core Threads::Threads)
+
+    add_executable(bench tests/bench.cpp)
+    target_link_libraries(bench PRIVATE cllm_core Threads::Threads)
+
+    add_test(NAME quant      COMMAND quant_test)
+    add_test(NAME threadpool COMMAND threadpool_test)
+    add_test(NAME sampler    COMMAND sampler_test)
+endif()
+
 # ---- 安装规则 ----
 include(GNUInstallDirs)
 

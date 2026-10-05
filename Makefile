@@ -31,7 +31,14 @@ install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
+# 运行测试与基准
+test:
+	@sh tests/run_tests.sh
+
+bench:
+	@sh tests/run_tests.sh --bench
+
 clean:
 	rm -f $(TARGET) $(OBJS)
 
-.PHONY: all install clean
+.PHONY: all install test bench clean

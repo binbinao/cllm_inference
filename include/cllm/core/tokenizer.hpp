@@ -21,8 +21,9 @@ public:
     // token ids -> 完整文本
     std::string decode(const std::vector<int>& ids) const;
 
-    // 应用 Qwen 风格 chat template（<|im_start|>system/user/assistant<|im_end|>），
-    // 返回不带 BOS 的 token ids。若模型无特殊 token 或非 chat 模型，回退为普通 encode。
+    // 应用对话模板（支持 ChatML/Qwen、Llama3、Llama2/Mistral 等主流格式）。
+    // 依据词表中实际存在的特殊 token 分派格式，返回不带 BOS 的 token ids。
+    // 若均不匹配则回退为普通 encode（不静默丢模板，而是明确退化）。
     std::vector<int> apply_chat_template(const std::string& user_message,
                                          const std::string& system_message = "") const;
 
@@ -30,6 +31,8 @@ public:
     int eos_id() const { return eos_id_; }
     bool add_bos_token() const { return add_bos_token_; }
     bool has_chat_template() const { return has_chat_template_; }
+    // 当前识别到的模板格式名（用于诊断/日志）
+    std::string chat_template_format() const { return chat_template_format_; }
 
 private:
     std::vector<std::string> tokens_;
@@ -38,6 +41,8 @@ private:
     bool is_gpt2_ = false;   // true: BPE；false: SentencePiece(llama 类)
     bool add_bos_token_ = true;
     bool has_chat_template_ = false;
+    std::string chat_template_;         // 原始 chat_template 字符串（Jinja）
+    std::string chat_template_format_;  // 识别出的格式名
 
     // BPE 合并排名
     std::unordered_map<std::string, int> merges_rank_;
