@@ -83,6 +83,7 @@ struct TransformerEngine::Impl {
     ModelConfig cfg;
     ThreadPool* pool = nullptr;
     const GgufModel* model = nullptr;   // 持有模型引用（数据来自其 mmap 区域）
+    bool use_quant = true;              // false 时权重反量化为 fp32 常驻，走 float matmul
 
     // 量化线性权重：直接引用 mmap 中数据，零拷贝，不常驻 float
     struct QuantWeight {
@@ -92,6 +93,8 @@ struct TransformerEngine::Impl {
         int in_dim = 0;
     };
     std::unordered_map<std::string, QuantWeight> QW;
+    // fp32 常驻权重缓冲（use_quant=false 时，QW[].data 指向这里的 float 数据）
+    std::unordered_map<std::string, std::vector<float>> FW;
     // norm 权重（量级小，反量化为 float 供 rms_norm 使用）
     std::unordered_map<std::string, std::vector<float>> NW;
     // bias 缓存（可选，Qwen2 等架构的 qkv 投影带 bias）
@@ -111,7 +114,13 @@ struct TransformerEngine::Impl {
         if (it == model.tensors.end()) {
             throw std::runtime_error("missing tensor: " + name);
         }
-        QW[name] = {it->second.data, it->second.type, out_dim, in_dim};
+        if (use_quant) {
+            QW[name] = {it->second.data, it->second.type, out_dim, in_dim};
+        } else {
+            std::vector<float> f = it->second.dequantize();
+            FW[name] = std::move(f);
+            QW[name] = {FW[name].data(), GgmlType::F32, out_dim, in_dim};
+        }
     }
 
     // 加载并反量化一维 norm 权重为 float
@@ -149,26 +158,52 @@ struct TransformerEngine::Impl {
         auto it = B.find(b_name);
         if (it != B.end()) b = &it->second;
         y.assign(w.out_dim, 0.0f);
-        matmul_quant(x.data(), w.data, w.type, b ? b->data() : nullptr,
-                     w.in_dim, w.out_dim, y.data(), pool);
+        if (use_quant) {
+            matmul_quant(x.data(), w.data, w.type, b ? b->data() : nullptr,
+                         w.in_dim, w.out_dim, y.data(), pool);
+        } else {
+            // fp32 常驻：纯 float 矩阵乘（并行）
+            const float* W = static_cast<const float*>(w.data);
+            auto row = [&](int j) {
+                const float* wr = W + (size_t)j * w.in_dim;
+                float s = 0.0f;
+                for (int i = 0; i < w.in_dim; ++i) s += x[i] * wr[i];
+                if (b) s += (*b)[j];
+                y[j] = s;
+            };
+            if (pool && w.out_dim >= 256) {
+                pool->parallel_for(0, (size_t)w.out_dim, [&](size_t bb, size_t ee) {
+                    for (size_t j = bb; j < ee; ++j) row((int)j);
+                });
+            } else {
+                for (int j = 0; j < w.out_dim; ++j) row(j);
+            }
+        }
     }
 
     // 取 embedding 矩阵第 token 行并反量化为 float（embedding 本身也可能是量化类型）
     void get_embedding(int token, std::vector<float>& x) {
         const auto& w = QW.at("token_embd.weight");
-        const int bs = block_size(w.type);
-        const size_t row_bytes = (size_t)(w.in_dim / bs) * type_size(w.type);
-        const uint8_t* base = static_cast<const uint8_t*>(w.data);
-        x.resize(w.in_dim);
-        dequantize_block(base + (size_t)token * row_bytes, x.data(), w.type, w.in_dim);
+        if (use_quant) {
+            const int bs = block_size(w.type);
+            const size_t row_bytes = (size_t)(w.in_dim / bs) * type_size(w.type);
+            const uint8_t* base = static_cast<const uint8_t*>(w.data);
+            x.resize(w.in_dim);
+            dequantize_block(base + (size_t)token * row_bytes, x.data(), w.type, w.in_dim);
+        } else {
+            const float* base = static_cast<const float*>(w.data);
+            x.assign(base + (size_t)token * w.in_dim,
+                     base + (size_t)token * w.in_dim + w.in_dim);
+        }
     }
 };
 
-TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
+TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool, bool use_quant)
     : impl_(std::make_unique<Impl>()) {
     auto& c = impl_->cfg = model.config;
     impl_->pool = &pool;
     impl_->model = &model;
+    impl_->use_quant = use_quant;
     impl_->n_embd = c.n_embd;
     impl_->n_head = c.n_head;
     impl_->n_head_kv = c.n_head_kv;

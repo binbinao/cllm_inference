@@ -13,7 +13,10 @@ namespace cllm {
 // 通过 ModelConfig 参数化，覆盖 Llama/Qwen/Mistral 同族架构。
 class TransformerEngine {
 public:
-    TransformerEngine(const GgufModel& model, ThreadPool& pool);
+    // use_quant=true（默认）：量化权重零拷贝引用 mmap，forward 走整数点积快速路径。
+    // use_quant=false：将所有量化权重反量化为 fp32 常驻内存，forward 走纯 float 矩阵乘，
+    //                 用于「量化 vs fp32」的公平性能对比。
+    TransformerEngine(const GgufModel& model, ThreadPool& pool, bool use_quant = true);
     ~TransformerEngine();
 
     TransformerEngine(const TransformerEngine&) = delete;
