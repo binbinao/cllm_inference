@@ -661,10 +661,86 @@ static inline float vec_dot_q4_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, i
 #endif
 }
 
+// Q6_K × Q8_0 vec_dot（标量版，用作 fallback 与数值参考）
+// 权重 super-block = 256 元素 = [ql:128B][qh:64B][scales:int8[16]B][d:f16]
+// 每元素 6-bit：ql 存低 4 位，qh 存高 2 位
+// 每 16 元素共用一个 int8 scale（有符号）：w[i] = d * sc[i/16] * (q6[i] - 32)
+//
+// 激活用 Q8_0（block=32）。一个激活块覆盖 2 个 scale 组（元素 i..i+15 和 i+16..i+31）。
+// 32-元素子块点积：
+//   sub_dot = sum_j (w[j] * x[j])
+//           = d*d_x * ( sc_a*sum_{j=0..15}(q6*q_x) + sc_b*sum_{j=16..31}(q6*q_x) )
+//            - 32*d*d_x * (sc_a*sum_{j=0..15}(q_x) + sc_b*sum_{j=16..31}(q_x))
+// 后一项需要激活 "每 16 元素" 的 sum（bsums 是 32 粒度），需在循环内即时累加。
+[[maybe_unused]] static float vec_dot_q6_k_q8_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const uint8_t* ql = w; w += 128;
+        const uint8_t* qh = w; w += 64;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(w); w += 16;
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+
+        const int64_t x_base = s * 8;  // 该 super-block 的第一个激活块索引
+
+        // 按 128 元素一组迭代（共 2 组），每组内按 32 元素子块索引 l
+        for (int grp = 0; grp < 2; ++grp) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                // 每 l 对应 4 个元素，分别位于 4 个 32-元素子块（相对 base）：
+                //   子块 0: 元素 l           (16 元素 scale sc[is])
+                //   子块 1: 元素 l+32        (sc[is+2])
+                //   子块 2: 元素 l+64 (-->l) (sc[is+4])
+                //   子块 3: 元素 l+96        (sc[is+6])
+                int q1 = (ql[l] & 0xF)      | (((qh[l] >> 0) & 3) << 4);
+                int q2 = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+                int q3 = (ql[l] >> 4)       | (((qh[l] >> 4) & 3) << 4);
+                int q4 = (ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4);
+
+                // 子块 0..3 分别对应激活块 x_base + grp*4 + 0..3
+                // 子块内第 l 元素（当 l < 16 时在前半，否则在后半）
+                int block_within_32 = l;   // 0..31
+                int b0 = (int)(x_base + grp * 4 + 0);
+                int b1 = (int)(x_base + grp * 4 + 1);
+                int b2 = (int)(x_base + grp * 4 + 2);
+                int b3 = (int)(x_base + grp * 4 + 3);
+                const int8_t qx0 = qx_qs[b0 * 32 + block_within_32];
+                const int8_t qx1 = qx_qs[b1 * 32 + block_within_32];
+                const int8_t qx2 = qx_qs[b2 * 32 + block_within_32];
+                const int8_t qx3 = qx_qs[b3 * 32 + block_within_32];
+
+                // 单元素贡献 = d * sc * d_x * ((q6 - 32) * q_x)
+                acc += d * sc[is + 0] * qx_sc[b0] * (float)((q1 - 32) * qx0);
+                acc += d * sc[is + 2] * qx_sc[b1] * (float)((q2 - 32) * qx1);
+                acc += d * sc[is + 4] * qx_sc[b2] * (float)((q3 - 32) * qx2);
+                acc += d * sc[is + 6] * qx_sc[b3] * (float)((q4 - 32) * qx3);
+            }
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    return acc;
+}
+
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+// Q6_K NEON 版本留待后续（Q6_K 使用率低且解包逻辑复杂，当前先确保正确性）
+#endif
+
+static inline float vec_dot_q6_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    // Q6_K 当前仅标量版，性能从 "按行反量化+float乘" 升级为 "整数乘累加"（Phase 5）
+    // 相比 Q8_0/Q4_K NEON 版，速度收益较小，但正确性有保障
+    return vec_dot_q6_k_q8_scalar(w, qx, n);
+}
+
 bool has_vec_dot(GgmlType type) {
     switch (type) {
         case GgmlType::Q8_0: return true;
         case GgmlType::Q4_K: return true;
+        case GgmlType::Q6_K: return true;
         default: return false;
     }
 }
@@ -675,6 +751,7 @@ float vec_dot_row(const void* w_row, GgmlType w_type,
     switch (w_type) {
         case GgmlType::Q8_0: return vec_dot_q8_0_q8_0(w, qx, n);
         case GgmlType::Q4_K: return vec_dot_q4_k_q8(w, qx, n);
+        case GgmlType::Q6_K: return vec_dot_q6_k_q8(w, qx, n);
         default:
             throw std::runtime_error("vec_dot_row: no kernel for this type");
     }

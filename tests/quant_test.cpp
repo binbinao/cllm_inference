@@ -233,19 +233,25 @@ void test_unsupported() {
 }
 
 // ---- matmul_quant：与「反量化 + float 点积」参考实现逐元素比对 ----
-void test_matmul_quant() {
-    std::printf("[matmul_quant]\n");
-    const int out_dim = 40, in_dim = 64;  // Q8_0 block=32 -> 64/32=2 块
-    // 构造量化权重：d=1.0，qs 用可预测的值
-    const int bs = 32;
-    const size_t row_bytes = (in_dim / bs) * type_size(GgmlType::Q8_0);
+// 对所有已注册 vec_dot 快路径的类型（Q8_0/Q4_K/Q6_K）均校验
+void test_matmul_quant_type(const char* name, GgmlType type) {
+    std::printf("[matmul_quant %s]\n", name);
+    const int bs = block_size(type);
+    // 维度要能被 block_size 整除；对 K 系列（bs=256）取 in_dim=256，out_dim=40
+    const int in_dim = (bs <= 32) ? 64 : 256;
+    const int out_dim = 40;
+    const size_t row_bytes = (size_t)(in_dim / bs) * type_size(type);
     std::vector<uint8_t> w(row_bytes * out_dim, 0);
     for (int j = 0; j < out_dim; ++j) {
         uint8_t* row = &w[(size_t)j * row_bytes];
         for (int blk = 0; blk < in_dim / bs; ++blk) {
-            uint8_t* p = row + (size_t)blk * type_size(GgmlType::Q8_0);
+            uint8_t* p = row + (size_t)blk * type_size(type);
+            // 第一个 f16 处写 1.0（Q8_0/Q4_K/Q6_K 都有 d:f16 在前）
             put_f16(p, H1);
-            for (int i = 0; i < bs; ++i) p[2 + i] = (uint8_t)((i + j) % 7 - 3);  // 有正有负
+            // 其余字节填入可预测的小值
+            for (size_t k = 2; k < type_size(type); ++k) {
+                p[k] = (uint8_t)((k + blk + j) % 7);
+            }
         }
     }
     std::vector<float> x(in_dim);
@@ -253,30 +259,54 @@ void test_matmul_quant() {
 
     // 内核结果
     std::vector<float> y(out_dim);
-    matmul_quant(x.data(), w.data(), GgmlType::Q8_0, nullptr, in_dim, out_dim, y.data(), nullptr);
+    matmul_quant(x.data(), w.data(), type, nullptr, in_dim, out_dim, y.data(), nullptr);
 
-    // 参考：逐行反量化后点积
+    // 参考：逐行反量化后点积（float matmul）
     int mism = 0;
     for (int j = 0; j < out_dim; ++j) {
         std::vector<float> row(in_dim);
-        dequantize_block(&w[(size_t)j * row_bytes], row.data(), GgmlType::Q8_0, in_dim);
+        dequantize_block(&w[(size_t)j * row_bytes], row.data(), type, in_dim);
         double ref = 0;
         for (int i = 0; i < in_dim; ++i) ref += (double)x[i] * row[i];
-        // 容差：vec_dot 快路径对激活也量化为 Q8_0，引入 ~1/127 的量化步长；
-        // round-half-to-even 对 x.5 边界取偶数，可产生最高约 2.4% 的系统偏差（见 llama.cpp）。
-        // 这里取 3% 相对或 1e-2 绝对（较宽者）作为上限。
-        double tol = std::max(1e-2, 0.03 * std::fabs(ref));
+        // 容差：激活量化 round-half-to-even 产生 ~2.4% 系统偏差；
+        // K 系列权重有 min 偏移项（Q4_K/Q6_K），参考值小时相对误差放大。
+        //   非 K 系列（bs=32）：max(1e-2, 3%)
+        //   K 系列  (bs=256)：max(3e-2, 6%)
+        double abs_tol = (bs <= 32) ? 1e-2 : 3e-2;
+        double rel_tol = (bs <= 32) ? 0.03 : 0.06;
+        double tol = std::max(abs_tol, rel_tol * std::fabs(ref));
         if (std::fabs(ref - y[j]) > tol) ++mism;
     }
     if (mism == 0) { ++g_pass; std::printf("  OK %d rows matched\n", out_dim); }
     else { g_fail += mism; std::printf("  FAIL %d/%d rows mismatched\n", mism, out_dim); }
+}
 
-    // bias 生效验证（bias 本身是精确加法，容差仍可严格）
+void test_matmul_quant() {
+    test_matmul_quant_type("Q8_0", GgmlType::Q8_0);
+    test_matmul_quant_type("Q4_K", GgmlType::Q4_K);
+    test_matmul_quant_type("Q6_K", GgmlType::Q6_K);
+
+    // bias 生效验证（Q8_0）
+    const int bs = 32;
+    const int in_dim = 64, out_dim = 40;
+    const size_t row_bytes = (size_t)(in_dim / bs) * type_size(GgmlType::Q8_0);
+    std::vector<uint8_t> w(row_bytes * out_dim, 0);
+    for (int j = 0; j < out_dim; ++j) {
+        uint8_t* row = &w[(size_t)j * row_bytes];
+        for (int blk = 0; blk < in_dim / bs; ++blk) {
+            uint8_t* p = row + (size_t)blk * type_size(GgmlType::Q8_0);
+            put_f16(p, H1);
+            for (int i = 0; i < bs; ++i) p[2 + i] = (uint8_t)((i + j) % 7 - 3);
+        }
+    }
+    std::vector<float> x(in_dim);
+    for (int i = 0; i < in_dim; ++i) x[i] = (float)((i % 5) - 2) * 0.5f;
+    std::vector<float> y(out_dim), y2(out_dim);
+    matmul_quant(x.data(), w.data(), GgmlType::Q8_0, nullptr, in_dim, out_dim, y.data(), nullptr);
     std::vector<float> bias(out_dim);
     for (int j = 0; j < out_dim; ++j) bias[j] = (float)j;
-    std::vector<float> y2(out_dim);
     matmul_quant(x.data(), w.data(), GgmlType::Q8_0, bias.data(), in_dim, out_dim, y2.data(), nullptr);
-    // 比较 y2[3] - y[3] 应约等于 bias[3] = 3；两次调用的量化误差一致所以差值精确
+    // 两次调用的激活量化误差完全相同，差值精确等于 bias
     CHECK_NEAR(y2[3] - y[3], 3.0, "matmul_quant bias");
 }
 
