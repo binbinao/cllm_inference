@@ -7,6 +7,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+// ARMv8.2+ 提供 vdotq_s32（SDOT 指令），一条指令完成 16 对 int8 乘加
+#if defined(__ARM_FEATURE_DOTPROD)
+#define CLLM_HAS_SDOT 1
+#else
+#define CLLM_HAS_SDOT 0
+#endif
+#endif
+
 namespace cllm {
 
 namespace {
@@ -447,11 +457,11 @@ void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n) {
     }
 }
 
-// Q8_0 × Q8_0 vec_dot（标量版）
+// Q8_0 × Q8_0 vec_dot（标量版，用作 fallback 与数值参考）
 // 权重块布局：[d_w:f16][qs_w:32 x int8] -> block_size=32, type_size=34
 // 激活块布局：Q8_0_act = [d_x:f32] + [qs_x:32 x int8]（存储于 QuantizedQ8_0 的两个独立数组）
 // 单块贡献：d_w * d_x * dot_int32(qs_w, qs_x)
-static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+[[maybe_unused]] static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
     constexpr int QK = 32;
     const int64_t nb = n / QK;
     const int8_t* qx_qs = qx.qs.data();
@@ -469,7 +479,46 @@ static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx,
     return acc;
 }
 
-// Q4_K × Q8_0 vec_dot（标量版）
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+// Q8_0 × Q8_0 vec_dot NEON SDOT 版本
+// 每块 32 元素 = 2 条 vdotq_s32，一条处理 16 对 int8（4 个 int32 累加通道）
+static float vec_dot_q8_0_q8_0_neon(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 32;
+    const int64_t nb = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    float acc = 0.0f;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d_w = half_to_float(*reinterpret_cast<const uint16_t*>(w));
+        const int8_t* qw = reinterpret_cast<const int8_t*>(w + 2);
+        const int8_t* qxb = qx_qs + b * QK;
+
+        int8x16_t qw_lo = vld1q_s8(qw);
+        int8x16_t qw_hi = vld1q_s8(qw + 16);
+        int8x16_t qx_lo = vld1q_s8(qxb);
+        int8x16_t qx_hi = vld1q_s8(qxb + 16);
+
+        int32x4_t sum_vec = vdupq_n_s32(0);
+        sum_vec = vdotq_s32(sum_vec, qw_lo, qx_lo);
+        sum_vec = vdotq_s32(sum_vec, qw_hi, qx_hi);
+        int32_t sum = vaddvq_s32(sum_vec);
+
+        acc += d_w * qx_sc[b] * (float)sum;
+        w += 34;
+    }
+    return acc;
+}
+#endif
+
+static inline float vec_dot_q8_0_q8_0(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+    return vec_dot_q8_0_q8_0_neon(w, qx, n);
+#else
+    return vec_dot_q8_0_q8_0_scalar(w, qx, n);
+#endif
+}
+
+// Q4_K × Q8_0 vec_dot（标量版，用作 fallback 与数值参考）
 // 权重 super-block = 256 元素 = 8 个 32-元素子块：
 //   [d:f16][dmin:f16][scales:12B][qs:128B]
 // 单元素恢复：w[i] = d*sc_k * q4[i] - dmin*m_k，其中 (sc_k, m_k) 由 get_scale_min_k4 解码
@@ -479,7 +528,7 @@ static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx,
 //           = sum_j ((d*sc*q4[j] - dmin*m) * d_x * q_x[j])
 //           = d*sc*d_x * sum(q4*q_x)  -  dmin*m*d_x * sum(q_x)
 // sum(q_x) 已在 quantize_row_q8_0 预计算 bsums[b]
-static float vec_dot_q4_k_q8_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+[[maybe_unused]] static float vec_dot_q4_k_q8_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
     constexpr int QK = 256;
     const int64_t n_super = n / QK;
     const int8_t* qx_qs = qx.qs.data();
@@ -534,6 +583,84 @@ static float vec_dot_q4_k_q8_scalar(const uint8_t* w, const QuantizedQ8_0& qx, i
 
 // --- 导出接口 ---
 
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+// Q4_K × Q8_0 vec_dot NEON SDOT 版本
+// 每子块（32 元素）：从 128B qs 中拆出低 nibble 和高 nibble，各 16 字节
+// SDOT 处理：qs_low (16B) · qxb (16B) -> int32x4，再按另一半聚合
+static float vec_dot_q4_k_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    const int8x16_t mask_lo = vdupq_n_s8(0x0F);
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* scales = w; w += 12;
+        const uint8_t* q = w;      w += 128;
+
+        const int64_t x_base = s * 8;
+        int is = 0;
+        for (int j = 0; j < QK; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m);
+            const float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m);
+            const float d2 = d * sc, m2 = dmin * m;
+
+            // 读取 32 字节 qs，拆出低 nibble (q4 低半块) 和高 nibble (q4 高半块)
+            // q4 值域 0-15，最高位 bit 一定为 0，故可直接当 int8 用于 SDOT
+            uint8x16_t raw0 = vld1q_u8(q);          // 元素 0..15 的 packed
+            uint8x16_t raw1 = vld1q_u8(q + 16);     // 元素 16..31 的 packed
+            int8x16_t q4_lo0 = vreinterpretq_s8_u8(vandq_u8(raw0, vreinterpretq_u8_s8(mask_lo)));
+            int8x16_t q4_lo1 = vreinterpretq_s8_u8(vandq_u8(raw1, vreinterpretq_u8_s8(mask_lo)));
+            int8x16_t q4_hi0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));  // 无符号右移保留 0-15
+            int8x16_t q4_hi1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+
+            // 低 nibble 子块
+            {
+                const int b_lo = (int)(x_base + is + 0);
+                const int8_t* qxb = qx_qs + (size_t)b_lo * 32;
+                int8x16_t qx0 = vld1q_s8(qxb);
+                int8x16_t qx1 = vld1q_s8(qxb + 16);
+                int32x4_t sum = vdupq_n_s32(0);
+                sum = vdotq_s32(sum, q4_lo0, qx0);
+                sum = vdotq_s32(sum, q4_lo1, qx1);
+                int32_t dot = vaddvq_s32(sum);
+                acc += d1 * qx_sc[b_lo] * (float)dot;
+                acc -= m1 * qx_sc[b_lo] * (float)qx_bs[b_lo];
+            }
+            // 高 nibble 子块
+            {
+                const int b_hi = (int)(x_base + is + 1);
+                const int8_t* qxb = qx_qs + (size_t)b_hi * 32;
+                int8x16_t qx0 = vld1q_s8(qxb);
+                int8x16_t qx1 = vld1q_s8(qxb + 16);
+                int32x4_t sum = vdupq_n_s32(0);
+                sum = vdotq_s32(sum, q4_hi0, qx0);
+                sum = vdotq_s32(sum, q4_hi1, qx1);
+                int32_t dot = vaddvq_s32(sum);
+                acc += d2 * qx_sc[b_hi] * (float)dot;
+                acc -= m2 * qx_sc[b_hi] * (float)qx_bs[b_hi];
+            }
+            q += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+#endif
+
+static inline float vec_dot_q4_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+    return vec_dot_q4_k_q8_neon(w, qx, n);
+#else
+    return vec_dot_q4_k_q8_scalar(w, qx, n);
+#endif
+}
+
 bool has_vec_dot(GgmlType type) {
     switch (type) {
         case GgmlType::Q8_0: return true;
@@ -546,8 +673,8 @@ float vec_dot_row(const void* w_row, GgmlType w_type,
                   const QuantizedQ8_0& qx, int64_t n) {
     const uint8_t* w = static_cast<const uint8_t*>(w_row);
     switch (w_type) {
-        case GgmlType::Q8_0: return vec_dot_q8_0_q8_0_scalar(w, qx, n);
-        case GgmlType::Q4_K: return vec_dot_q4_k_q8_scalar(w, qx, n);
+        case GgmlType::Q8_0: return vec_dot_q8_0_q8_0(w, qx, n);
+        case GgmlType::Q4_K: return vec_dot_q4_k_q8(w, qx, n);
         default:
             throw std::runtime_error("vec_dot_row: no kernel for this type");
     }
