@@ -412,7 +412,7 @@ std::vector<float> Tensor::dequantize() const {
 // 激活量化 + 整数点积快路径
 // =========================================================================
 
-// 将 float 向量量化为 Q8_0（block=32，absmax scale）
+// 将 float 向量量化为 Q8_0（block=32，absmax scale），并预计算每块 q 的 int32 之和
 void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n) {
     constexpr int QK8 = 32;
     if (n % QK8 != 0) {
@@ -422,6 +422,7 @@ void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n) {
     out.n = n;
     out.scales.resize(nb);
     out.qs.resize(n);
+    out.bsums.resize(nb);
     for (int64_t b = 0; b < nb; ++b) {
         const float* xb = x + b * QK8;
         float amax = 0.0f;
@@ -433,14 +434,16 @@ void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n) {
         const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
         out.scales[b] = d;
         int8_t* qb = out.qs.data() + b * QK8;
+        int32_t bsum = 0;
         for (int j = 0; j < QK8; ++j) {
             float v = xb[j] * id;
-            // 四舍五入到 int8；绝对值不超过 127
             int q = (int)std::nearbyint(v);
             if (q > 127) q = 127;
             if (q < -128) q = -128;
             qb[j] = (int8_t)q;
+            bsum += q;
         }
+        out.bsums[b] = bsum;
     }
 }
 
@@ -466,11 +469,75 @@ static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx,
     return acc;
 }
 
+// Q4_K × Q8_0 vec_dot（标量版）
+// 权重 super-block = 256 元素 = 8 个 32-元素子块：
+//   [d:f16][dmin:f16][scales:12B][qs:128B]
+// 单元素恢复：w[i] = d*sc_k * q4[i] - dmin*m_k，其中 (sc_k, m_k) 由 get_scale_min_k4 解码
+//
+// 32-元素子块对激活点积：
+//   sub_dot = sum_j (w[j] * x[j])
+//           = sum_j ((d*sc*q4[j] - dmin*m) * d_x * q_x[j])
+//           = d*sc*d_x * sum(q4*q_x)  -  dmin*m*d_x * sum(q_x)
+// sum(q_x) 已在 quantize_row_q8_0 预计算 bsums[b]
+static float vec_dot_q4_k_q8_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* scales = w; w += 12;
+        const uint8_t* q = w;      w += 128;
+
+        // 8 个 32-元素子块，激活块 base 索引 = s*8
+        const int64_t x_base = s * 8;
+        int is = 0;
+        for (int j = 0; j < QK; j += 64) {
+            // 子块 is+0：对应 x_base + is + 0，使用 q4 的低 nibble
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m);
+            const float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m);
+            const float d2 = d * sc, m2 = dmin * m;
+
+            // 低 nibble 子块：32 元素
+            {
+                const int b_lo = (int)(x_base + is + 0);
+                const int8_t* qxb = qx_qs + (size_t)b_lo * 32;
+                int32_t dot = 0;
+                for (int l = 0; l < 32; ++l) {
+                    dot += (int32_t)(q[l] & 0xF) * (int32_t)qxb[l];
+                }
+                acc += d1 * qx_sc[b_lo] * (float)dot;
+                acc -= m1 * qx_sc[b_lo] * (float)qx_bs[b_lo];
+            }
+            // 高 nibble 子块：32 元素
+            {
+                const int b_hi = (int)(x_base + is + 1);
+                const int8_t* qxb = qx_qs + (size_t)b_hi * 32;
+                int32_t dot = 0;
+                for (int l = 0; l < 32; ++l) {
+                    dot += (int32_t)(q[l] >> 4) * (int32_t)qxb[l];
+                }
+                acc += d2 * qx_sc[b_hi] * (float)dot;
+                acc -= m2 * qx_sc[b_hi] * (float)qx_bs[b_hi];
+            }
+            q += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
 // --- 导出接口 ---
 
 bool has_vec_dot(GgmlType type) {
     switch (type) {
         case GgmlType::Q8_0: return true;
+        case GgmlType::Q4_K: return true;
         default: return false;
     }
 }
@@ -480,6 +547,7 @@ float vec_dot_row(const void* w_row, GgmlType w_type,
     const uint8_t* w = static_cast<const uint8_t*>(w_row);
     switch (w_type) {
         case GgmlType::Q8_0: return vec_dot_q8_0_q8_0_scalar(w, qx, n);
+        case GgmlType::Q4_K: return vec_dot_q4_k_q8_scalar(w, qx, n);
         default:
             throw std::runtime_error("vec_dot_row: no kernel for this type");
     }

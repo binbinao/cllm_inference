@@ -51,6 +51,8 @@ void dequantize_block(const void* src, float* dst, GgmlType type, int64_t n);
 struct QuantizedQ8_0 {
     std::vector<float> scales;   // 每块 scale，长度 = n / 32
     std::vector<int8_t> qs;      // 量化值，长度 = n（n 需为 32 的倍数）
+    // 每块 qs 之和（int32），用于 Q4_K/Q5_K 等 "dmin*m*sum(q_x)" 项的高效计算
+    std::vector<int32_t> bsums;
     int64_t n = 0;               // 元素总数
 };
 
