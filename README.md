@@ -11,14 +11,14 @@
 - **完整 GGUF 解析**：支持 GGUF v2/v3，mmap 零拷贝加载
 - **量化类型全覆盖**：支持 F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K 共 13 种 GGML 量化格式
 - **零拷贝量化推理**：量化权重直接引用 mmap 数据，按输出行惰性反量化，无需加载期全量展开为 float32（0.5B Q4_K_M 常驻内存 ~430MB）
-- **整数点积内核**：激活在线量化为 Q8_0，Q8_0/Q4_K/Q6_K 权重走 vec_dot 快路径；在 Apple Silicon 上启用 ARMv8.2 SDOT NEON 指令，相对 "反量化 + float matmul" 提速 **4-5x**
+- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 六种权重走 vec_dot 快路径；在 Apple Silicon 上启用 ARMv8.2 SDOT NEON 指令，相对 "反量化 + float matmul" 提速 **3-7x**
 - **通用 Transformer 内核**：RMSNorm、NEOX RoPE、GQA Attention、SwiGLU FFN、KV Cache
 - **CPU 多线程**：手写线程池，按行/分块并行矩阵乘
 - **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
 - **多格式对话模板**：自动识别 ChatML（Qwen）/ Llama 3 / Llama 2·Mistral 并应用对应模板
 - **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
 - **内置 Web UI**：单文件 HTML 对话前端，支持流式输出、模型库浏览与启动命令生成（Qwen/Llama ≤30B）
-- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 135 项断言，含吞吐基准
+- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 140 项断言，含量化吞吐基准与模型级「量化 vs fp32」对比基准
 
 ---
 
@@ -51,7 +51,7 @@
 | 模块 | 职责 | 关键文件 |
 |------|------|---------|
 | `GgufLoader` | 解析 GGUF 元数据/词表/张量，mmap 零拷贝加载 | `src/core/gguf.cpp` |
-| `Quant` | GGML 量化权重（Q4_K/Q5_0/Q6_K/Q8_0/F32/F16）反量化为 float32 | `src/core/quant.cpp` |
+| `Quant` | GGML 量化权重反量化为 float32 + 六种类型（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K）整数点积内核 | `src/core/quant.cpp` |
 | `TransformerEngine` | 单步前向：RMSNorm + NEOX RoPE + GQA Attention + SwiGLU FFN，更新 KV Cache | `src/core/engine.cpp` |
 | `Tokenizer` | BPE（gpt2 类）/ SentencePiece 双模式编解码 + Qwen chat template | `src/core/tokenizer.cpp` |
 | `Sampler` | temperature / top-k / top-p 采样，从 logits 采样下一个 token | `src/core/sampler.cpp` |
@@ -221,8 +221,8 @@ curl http://127.0.0.1:8080/v1/completions \
 | 输出乱码 | 模型为 chat 模型但未走对话模板 | 确认模型含 `tokenizer.chat_template`；支持 ChatML / Llama3 / Llama2 |
 | 内存占用 | 量化权重按需反量化 | 0.5B Q4_K_M 约 430MB（相比全量反量化缓存的 ~3GB 大幅下降）|
 
-> 吞吐说明：Q8_0/Q4_K/Q6_K 已启用**激活量化 + 整数点积 vec_dot 快路径**，在 Apple Silicon 上跟进 NEON SDOT 指令，
-> 相对旧的 “按行反量化 + float matmul”有数倍吞吐提升（见下文「性能基准」）。其他量化类型划入 fallback 路径，行为不变。
+> 吞吐说明：Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 已启用**激活量化 + 整数点积 vec_dot 快路径**，在 Apple Silicon 上跟进 NEON SDOT 指令，
+> 相对旧的 “按行反量化 + float matmul”有 3-7x 吞吐提升（见下文「性能基准」）。其余量化类型（Q4_1/Q5_1/Q8_1/Q2_K/Q3_K）划入 fallback 路径，行为不变。
 
 ---
 
@@ -236,9 +236,10 @@ make test
 make bench
 ```
 
-- **覆盖范围**：13 种 GGML 量化类型反量化、`matmul_quant` 内核（Q8_0/Q4_K/Q6_K 均对比 float 参考路径）、
-  线程池并行一致性、采样器 greedy/top-k/top-p/温度行为，共 **135+ 项断言**。
-- **基准**：`tests/bench.cpp` 报告各量化类型的 GFLOP/s 及相对纯 float matmul 的比值。
+- **覆盖范围**：13 种 GGML 量化类型反量化、`matmul_quant` 内核（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 均对比 float 参考路径）、
+  线程池并行一致性、采样器 greedy/top-k/top-p/温度行为，共 **140+ 项断言**。
+- **基准**：`tests/bench.cpp` 报告各量化类型的 GFLOP/s 及相对纯 float matmul 的比值；
+  `tests/model_bench.cpp` 对真实模型做「量化 vs 反量化 fp32」的 prefill/decode 对比（见下文）。
 - CMake 构建下：`cmake --build build && ctest --test-dir build`。
 
 ### 性能基准（Apple M4，`in=1024 out=1024`）
@@ -277,6 +278,38 @@ make bench
 > 端到端长案例参考（256 tokens，仅供体感）：Qwen3-0.6B-Q8_0 ≈ 15.7 tok/s。
 > 端到端因模型架构/参数量/FFN 宽度不同（如 Qwen2.5-0.5B 的 n_ff=4864 远大于 Qwen3-0.6B 的 3072），
 > **不适合**用于量化位数的公平对齐，公平对齐应使用上表统一维度的 micro-benchmark。
+
+### 模型级量化 vs 反量化 fp32 对比
+
+`tests/model_bench.cpp` 对真实模型分别用两种推理路径（`TransformerEngine` 的 `use_quant` 开关控制）：
+
+- **反量化 fp32**（`use_quant=false`）：量化权重 `dequantize()` 为 fp32 常驻，forward 走纯 float 矩阵乘
+- **量化**（`use_quant=true`）：权重零拷贝引用 mmap，forward 走 vec_dot 整数点积快速路径
+
+实测（Apple M4，10 线程，输入长度 16/32/64/128/256 token）：
+
+| 模型 | 实际量化（参数量占比） | prefill 加速 | decode 加速 |
+|------|----------------------|-------------|-------------|
+| qwen2.5-0.5b-instruct-q4_k_m | Q5_0 61.6% + Q8_0 21.8% + Q4_K/Q6_K | 3.3~6.5x | 2.8~5.6x |
+| Qwen3-0.6B-Q8_0 | Q8_0 100% | 3.7~5.1x | 3.8~8.1x |
+| Llama-3.2-1B-Instruct-Q4_K_M | Q4_K 67.2% + Q6_K 32.8% | 5.7~6.7x | 3.0~13.7x |
+
+**结论**：
+
+- 量化相对 fp32 的 **prefill 加速稳定在 3~7x**，主要来自 FFN/投影矩阵乘的整数点积 + 更低内存带宽。
+- **decode 加速比波动更大**（3~13x），因为 decode 的 attention 为 float 计算、不受量化影响，且随序列变长占比上升。
+- ⚠️ **文件名可能与实际量化不符**：`qwen2.5-0.5b-instruct-q4_k_m.gguf` 的实际主体是 **Q5_0（61.6%）**，
+  并非文件名标注的 Q4_K_M。`model_bench` 会打印每个模型的真实量化类型分布（按参数量加权），便于识别。
+
+用法：
+
+```bash
+# 对指定模型对比（或直接运行，默认测 models/ 下三个模型）
+clang++ -std=c++20 -O2 -Iinclude tests/model_bench.cpp \
+  src/core/engine.cpp src/core/gguf.cpp src/core/quant.cpp src/core/sampler.cpp \
+  src/core/thread_pool.cpp src/core/tokenizer.cpp -o /tmp/model_bench -pthread
+/tmp/model_bench models/Qwen3-0.6B-Q8_0.gguf
+```
 
 ---
 
@@ -326,6 +359,7 @@ cllm_inference/
 │   ├── threadpool_test.cpp # 线程池并行一致性
 │   ├── sampler_test.cpp    # 采样器行为
 │   ├── bench.cpp           # 量化内核吞吐基准
+│   ├── model_bench.cpp     # 模型级「量化 vs fp32」对比基准
 │   └── run_tests.sh        # 一键运行
 └── web/                    # 单文件前端（HTTP 服务自动托管）
     ├── index.html          # 对话界面 + 模型库 + SSE 流式
