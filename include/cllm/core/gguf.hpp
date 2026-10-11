@@ -22,8 +22,14 @@ struct ModelConfig {
     float rope_theta = 10000.0f;  // rope freq base
     float norm_eps = 1e-5f;       // rms norm epsilon
 
-    // 派生量
-    uint32_t head_dim() const { return n_embd / n_head; }
+    // 可选：显式 head_dim（Qwen3 等模型通过 attention.key_length 单独指定，
+    // 此时 n_head * head_dim 可能 != n_embd）。0 表示未提供，退化为 n_embd / n_head。
+    uint32_t head_dim_explicit = 0;
+
+    // 有效 head_dim：优先用显式值，否则派生自 n_embd/n_head
+    uint32_t head_dim() const {
+        return head_dim_explicit > 0 ? head_dim_explicit : (n_embd / n_head);
+    }
 };
 
 // GGUF metadata 的通用值容器（仅保存我们关心的标量/字符串/数组）

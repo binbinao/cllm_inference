@@ -124,6 +124,15 @@ struct TransformerEngine::Impl {
         (void)n;
     }
 
+    // 可选加载 norm 权重（张量不存在则跳过，返回是否成功）。
+    // 用途：Qwen3 的 attn_q_norm/attn_k_norm 在 Qwen2/Llama 中不存在。
+    bool load_norm_optional(const GgufModel& model, const std::string& name) {
+        auto it = model.tensors.find(name);
+        if (it == model.tensors.end()) return false;
+        NW[name] = it->second.dequantize();
+        return true;
+    }
+
     // 可选加载 bias（不存在则跳过，返回是否加载成功）
     bool load_bias(const GgufModel& model, const std::string& name) {
         auto it = model.tensors.find(name);
@@ -163,7 +172,9 @@ TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
     impl_->n_embd = c.n_embd;
     impl_->n_head = c.n_head;
     impl_->n_head_kv = c.n_head_kv;
-    impl_->head_dim = c.n_embd / c.n_head;
+    // head_dim 使用 ModelConfig 的派生方法：若 GGUF 显式提供 attention.key_length
+    // （Qwen3 等）则直接采用；否则退化为 n_embd / n_head（Qwen2/Llama 等）
+    impl_->head_dim = c.head_dim();
 
     if (c.arch.empty()) throw std::runtime_error("unknown architecture (missing general.architecture)");
 
@@ -177,20 +188,29 @@ TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool)
     }
     impl_->load_norm(model, "output_norm.weight", c.n_embd);
 
-    // 每层权重
+    // 每层权重：
+    // - Q 投影：out = n_head * head_dim（Qwen3 可能 != n_embd）
+    // - K/V 投影：out = n_head_kv * head_dim（GQA）
+    // - 输出投影：in = n_head * head_dim，out = n_embd
     impl_->k_cache.resize(c.n_layers);
     impl_->v_cache.resize(c.n_layers);
-    int kv_dim = c.n_head_kv * impl_->head_dim;
+    const int head_dim = impl_->head_dim;
+    const int q_dim = c.n_head * head_dim;
+    const int kv_dim = c.n_head_kv * head_dim;
     for (uint32_t l = 0; l < c.n_layers; ++l) {
         std::string p = "blk." + std::to_string(l) + ".";
         impl_->load_norm(model, p + "attn_norm.weight", c.n_embd);
-        impl_->load_weight(model, p + "attn_q.weight", c.n_embd, c.n_embd);
+        impl_->load_weight(model, p + "attn_q.weight", q_dim, c.n_embd);
         impl_->load_weight(model, p + "attn_k.weight", kv_dim, c.n_embd);
         impl_->load_weight(model, p + "attn_v.weight", kv_dim, c.n_embd);
+        // QKV bias（Qwen2 有；Qwen3/Llama 无，load_bias 返回 false 不报错）
         impl_->load_bias(model, p + "attn_q.bias");
         impl_->load_bias(model, p + "attn_k.bias");
         impl_->load_bias(model, p + "attn_v.bias");
-        impl_->load_weight(model, p + "attn_output.weight", c.n_embd, c.n_embd);
+        // Q/K 层级归一化（Qwen3 新增，size = head_dim；其他架构没有，静默跳过）
+        impl_->load_norm_optional(model, p + "attn_q_norm.weight");
+        impl_->load_norm_optional(model, p + "attn_k_norm.weight");
+        impl_->load_weight(model, p + "attn_output.weight", c.n_embd, q_dim);
         impl_->load_norm(model, p + "ffn_norm.weight", c.n_embd);
         impl_->load_weight(model, p + "ffn_gate.weight", c.n_ff, c.n_embd);
         impl_->load_weight(model, p + "ffn_up.weight", c.n_ff, c.n_embd);
@@ -231,6 +251,33 @@ std::vector<float> TransformerEngine::forward(int token) {
         I.mm(p + "attn_q.weight", p + "attn_q.bias", h, q);
         I.mm(p + "attn_k.weight", p + "attn_k.bias", h, k);
         I.mm(p + "attn_v.weight", p + "attn_v.bias", h, v);
+
+        // Qwen3 专属：对每个 head 的 Q/K 分别做 RMSNorm（权重 size = head_dim）。
+        // 其他架构（Qwen2/Llama）无此权重，跳过。
+        {
+            auto itq = I.NW.find(p + "attn_q_norm.weight");
+            if (itq != I.NW.end()) {
+                const auto& wq = itq->second;
+                for (int hd = 0; hd < I.n_head; ++hd) {
+                    float* qh = q.data() + hd * head_dim;
+                    float sum = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) sum += qh[d] * qh[d];
+                    float rms = 1.0f / std::sqrt(sum / head_dim + c.norm_eps);
+                    for (int d = 0; d < head_dim; ++d) qh[d] = qh[d] * rms * wq[d];
+                }
+            }
+            auto itk = I.NW.find(p + "attn_k_norm.weight");
+            if (itk != I.NW.end()) {
+                const auto& wk = itk->second;
+                for (int hd = 0; hd < I.n_head_kv; ++hd) {
+                    float* kh = k.data() + hd * head_dim;
+                    float sum = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) sum += kh[d] * kh[d];
+                    float rms = 1.0f / std::sqrt(sum / head_dim + c.norm_eps);
+                    for (int d = 0; d < head_dim; ++d) kh[d] = kh[d] * rms * wk[d];
+                }
+            }
+        }
 
         int pos = I.seq_len;
         apply_rope(q.data(), I.n_head, head_dim, pos, c.rope_theta);

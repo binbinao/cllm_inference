@@ -123,7 +123,8 @@ mkdir -p models
 # 从 HuggingFace 等渠道下载 gguf 文件到 models/ 目录
 ```
 
-> 已支持架构：`qwen2`（含 GQA、bias 投影、NEOX RoPE）。模型量化类型需覆盖 Q5_0 / Q4_K / Q6_K / Q8_0 / F32 / F16。
+> 已支持架构：`qwen2`、`qwen3`（含 head_dim 独立、Q/K 层级 RMSNorm）、`llama`。
+> 模型量化类型需覆盖 13 种 GGML 格式（F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K）。
 
 ### 2. 本地 CLI 推理
 

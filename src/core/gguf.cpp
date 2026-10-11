@@ -225,6 +225,8 @@ GgufModel GgufLoader::load(const std::string& path) {
     model.config.n_head_kv = get_u32_field("attention.head_count_kv");
     model.config.n_ctx = get_u32_field("context_length");
     model.config.n_ff = get_u32_field("feed_forward_length");
+    // 显式 head_dim（Qwen3 等模型用，Qwen2/Llama 不提供时留 0 由 head_dim() 派生）
+    model.config.head_dim_explicit = get_u32_field("attention.key_length");
     float rope = get_f32_field("rope.freq_base");
     if (rope > 0) model.config.rope_theta = rope;
     float eps = get_f32_field("attention.layer_norm_rms_epsilon");

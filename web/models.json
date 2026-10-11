@@ -1,6 +1,6 @@
 {
-  "updated": "2026-10-05",
-  "note": "内置模型清单：仅列出 Qwen 与 Llama 系列（≤30B）常用 GGUF。下载后将 .gguf 文件放入项目的 models/ 目录，使用 --model models/<文件名> 启动即可。",
+  "updated": "2026-10-11",
+  "note": "内置模型清单：仅列出 Qwen 与 Llama 系列（≤30B）常用 GGUF。下载后将 .gguf 文件放入项目的 models/ 目录，使用 --model models/<文件名> 启动即可。Qwen3 小尺寸（0.6B/1.7B）官方仅提供 Q8_0。",
   "models": [
     {
       "id": "qwen2.5-0.5b-instruct-q4_k_m",
@@ -58,26 +58,26 @@
       "file": "qwen2.5-14b-instruct-q4_k_m.gguf"
     },
     {
-      "id": "qwen3-0.6b-q4_k_m",
-      "name": "Qwen3 0.6B (Q4_K_M)",
+      "id": "qwen3-0.6b-q8_0",
+      "name": "Qwen3 0.6B (Q8_0)",
       "family": "qwen",
       "params": "0.6B",
-      "quant": "Q4_K_M",
-      "size_mb": 460,
-      "ctx": 32768,
-      "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-      "file": "Qwen3-0.6B-Q4_K_M.gguf"
+      "quant": "Q8_0",
+      "size_mb": 639,
+      "ctx": 40960,
+      "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+      "file": "Qwen3-0.6B-Q8_0.gguf"
     },
     {
-      "id": "qwen3-1.7b-q4_k_m",
-      "name": "Qwen3 1.7B (Q4_K_M)",
+      "id": "qwen3-1.7b-q8_0",
+      "name": "Qwen3 1.7B (Q8_0)",
       "family": "qwen",
       "params": "1.7B",
-      "quant": "Q4_K_M",
-      "size_mb": 1130,
-      "ctx": 32768,
-      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
-      "file": "Qwen3-1.7B-Q4_K_M.gguf"
+      "quant": "Q8_0",
+      "size_mb": 1830,
+      "ctx": 40960,
+      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf",
+      "file": "Qwen3-1.7B-Q8_0.gguf"
     },
     {
       "id": "qwen3-4b-q4_k_m",
@@ -86,7 +86,7 @@
       "params": "4B",
       "quant": "Q4_K_M",
       "size_mb": 2500,
-      "ctx": 32768,
+      "ctx": 40960,
       "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
       "file": "Qwen3-4B-Q4_K_M.gguf"
     },
@@ -97,7 +97,7 @@
       "params": "8B",
       "quant": "Q4_K_M",
       "size_mb": 5100,
-      "ctx": 32768,
+      "ctx": 40960,
       "url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
       "file": "Qwen3-8B-Q4_K_M.gguf"
     },
@@ -108,7 +108,7 @@
       "params": "14B",
       "quant": "Q4_K_M",
       "size_mb": 9080,
-      "ctx": 32768,
+      "ctx": 40960,
       "url": "https://huggingface.co/Qwen/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf",
       "file": "Qwen3-14B-Q4_K_M.gguf"
     },
