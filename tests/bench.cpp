@@ -54,15 +54,44 @@ double time_ms(std::chrono::steady_clock::time_point a, std::chrono::steady_cloc
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-struct Case { const char* name; GgmlType type; };
+struct Case { const char* name; GgmlType type; int bits; };
+
+// 每种类型每个元素占用的字节数（用于计算读权重的有效内存带宽）
+double bytes_per_elem(GgmlType t) {
+    switch (t) {
+        case GgmlType::F32: return 4.0;
+        case GgmlType::F16: return 2.0;
+        default: return (double)type_size(t) / (double)block_size(t);
+    }
+}
+
+// 每种类型的名义量化位数（用于展示"量化越小"的单调性）
+int type_bits(GgmlType t) {
+    switch (t) {
+        case GgmlType::F32: return 32;
+        case GgmlType::F16: return 16;
+        case GgmlType::Q8_0: case GgmlType::Q8_1: return 8;
+        case GgmlType::Q6_K: return 6;
+        case GgmlType::Q5_0: case GgmlType::Q5_1: case GgmlType::Q5_K: return 5;
+        case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q4_K: return 4;
+        case GgmlType::Q3_K: return 3;
+        case GgmlType::Q2_K: return 2;
+        default: return 0;
+    }
+}
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    // 用法：bench [iters] [out_dim]
+    //   iters   迭代次数（默认 50）
+    //   out_dim 输出维度（默认 1024）；调大可让内存带宽成为瓶颈，
+    //           从而观察"量化越小 → 权重字节越少 → 越快"的对齐关系
     int iters = (argc > 1) ? std::atoi(argv[1]) : 50;
+    int out_dim = (argc > 2) ? std::atoi(argv[2]) : 1024;
 
-    // 维度取 1024（可被 K 量化的 256 block 整除），模拟典型隐藏层规模
-    const int in_dim = 1024, out_dim = 1024;
+    // in_dim 固定 1024（典型 hidden 维度，且能整除 32 与 256 block）
+    const int in_dim = 1024;
     std::vector<float> x(in_dim);
     for (int i = 0; i < in_dim; ++i) x[i] = (float)((i % 7) - 3) * 0.1f;
 
@@ -84,18 +113,21 @@ int main(int argc, char** argv) {
     t_float /= iters;
 
     Case cases[] = {
-        {"F32",  GgmlType::F32},
-        {"F16",  GgmlType::F16},
-        {"Q8_0", GgmlType::Q8_0},
-        {"Q4_0", GgmlType::Q4_0},
-        {"Q5_0", GgmlType::Q5_0},
-        {"Q6_K", GgmlType::Q6_K},
-        {"Q4_K", GgmlType::Q4_K},
+        {"F32",  GgmlType::F32,  32},
+        {"F16",  GgmlType::F16,  16},
+        {"Q8_0", GgmlType::Q8_0,  8},
+        {"Q6_K", GgmlType::Q6_K,  6},
+        {"Q5_0", GgmlType::Q5_0,  5},
+        {"Q4_K", GgmlType::Q4_K,  4},
+        {"Q4_0", GgmlType::Q4_0,  4},
     };
 
-    std::printf("%-6s %10s %12s %14s\n", "type", "ms/op", "GFLOP/s", "vs float");
-    std::printf("%-6s %10.3f %12.2f %14s\n", "float", t_float,
-                2.0 * in_dim * out_dim / (t_float * 1e6), "1.00x");
+    std::printf("%-6s %4s %8s %10s %10s %10s %10s\n",
+                "type", "bits", "B/elem", "ms/op", "GFLOP/s", "BW(GB/s)", "vs float");
+    std::printf("%-6s %4s %8.2f %10.3f %10.2f %10.2f %10s\n",
+                "float", "32", 4.0, t_float,
+                2.0 * in_dim * out_dim / (t_float * 1e6),
+                (double)out_dim * in_dim * 4.0 / (t_float * 1e6), "1.00x");
 
     for (const auto& c : cases) {
         std::vector<uint8_t> wq = make_quant_weight(c.type, in_dim, out_dim);
@@ -109,9 +141,12 @@ int main(int argc, char** argv) {
         }
         t /= iters;
         double gflops = 2.0 * in_dim * out_dim / (t * 1e6);
-        std::printf("%-6s %10.3f %12.2f %13.2fx\n", c.name, t, gflops, t_float / t);
+        double bw = (double)out_dim * in_dim * bytes_per_elem(c.type) / (t * 1e6);
+        std::printf("%-6s %4d %8.2f %10.3f %10.2f %10.2f %9.2fx\n",
+                    c.name, c.bits, bytes_per_elem(c.type), t, gflops, bw, t_float / t);
     }
 
     std::printf("\n注：量化内核按需反量化，省内存；此处对比其与纯 float matmul 的吞吐。\n");
+    std::printf("    BW(GB/s) = 读权重有效带宽，量化越小该值越低，带宽瓶颈下推理越快。\n");
     return 0;
 }

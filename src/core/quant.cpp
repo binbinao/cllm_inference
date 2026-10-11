@@ -727,13 +727,92 @@ static inline float vec_dot_q4_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, i
 }
 
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
-// Q6_K NEON 版本留待后续（Q6_K 使用率低且解包逻辑复杂，当前先确保正确性）
+// Q6_K × Q8_0 vec_dot NEON SDOT 版本
+// 布局回顾（每 super-block 256 元素）：
+//   ql:128B（低4位） qh:64B（高2位） scales:int8[16]（每16元素一个） d:f16
+// 每 128 元素一组，组内 4 个 32-元素子块：
+//   子块0: 元素 0..31   低4位=ql[0..31] 低nibble, 高2位=qh[0..31] bit0-1
+//   子块1: 元素 32..63  低4位=ql[32..63]低nibble, 高2位=qh[0..31] bit2-3
+//   子块2: 元素 64..95  低4位=ql[0..31] 高nibble, 高2位=qh[0..31] bit4-5
+//   子块3: 元素 96..127 低4位=ql[32..63]高nibble, 高2位=qh[0..31] bit6-7
+// q6 = low4 | (high2 << 4)（0..63），减 32 得 -32..31 的 int8
+// 点积：sub = d * d_x * (sc_a * dot(q6[0..15], qx[0..15]) + sc_b * dot(q6[16..31], qx[16..31]))
+static float vec_dot_q6_k_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int8x16_t v32 = vdupq_n_s8(32);
+    const uint8x16_t v0x0F = vdupq_n_u8(0x0F);
+    const uint8x16_t v0x03 = vdupq_n_u8(0x03);
+
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const uint8_t* ql = w; w += 128;
+        const uint8_t* qh = w; w += 64;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(w); w += 16;
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+
+        const int64_t x_base = s * 8;
+
+        for (int grp = 0; grp < 2; ++grp) {
+            const uint8_t* ql_g = ql + (size_t)grp * 64;
+            const uint8_t* qh_g = qh + (size_t)grp * 32;
+            const int8_t* sc_g = sc + grp * 8;
+
+            const uint8x16_t ql_lo0 = vld1q_u8(ql_g);       // ql[0..15]
+            const uint8x16_t ql_lo1 = vld1q_u8(ql_g + 16);  // ql[16..31]
+            const uint8x16_t ql_hi0 = vld1q_u8(ql_g + 32);  // ql[32..47]
+            const uint8x16_t ql_hi1 = vld1q_u8(ql_g + 48);  // ql[48..63]
+            const uint8x16_t qh0 = vld1q_u8(qh_g);          // qh[0..15]
+            const uint8x16_t qh1 = vld1q_u8(qh_g + 16);     // qh[16..31]
+
+            // 解包一个 32 元素子块并累加点积（SHIFT 必须为编译期常量）
+            auto sub = [&]<int SHIFT>(const uint8x16_t& ql0, const uint8x16_t& ql1,
+                                      bool low_in_hi, int sub_idx) {
+                const uint8x16_t lo0 = low_in_hi ? vshrq_n_u8(ql0, 4) : vandq_u8(ql0, v0x0F);
+                const uint8x16_t lo1 = low_in_hi ? vshrq_n_u8(ql1, 4) : vandq_u8(ql1, v0x0F);
+                uint8x16_t qh_s0, qh_s1;
+                if constexpr (SHIFT == 0) {
+                    qh_s0 = qh0;
+                    qh_s1 = qh1;
+                } else {
+                    qh_s0 = vshrq_n_u8(qh0, SHIFT);
+                    qh_s1 = vshrq_n_u8(qh1, SHIFT);
+                }
+                const uint8x16_t hi0 = vshlq_n_u8(vandq_u8(qh_s0, v0x03), 4);
+                const uint8x16_t hi1 = vshlq_n_u8(vandq_u8(qh_s1, v0x03), 4);
+                const int8x16_t q6_0 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo0, hi0)), v32);
+                const int8x16_t q6_1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo1, hi1)), v32);
+
+                const int b = (int)(x_base + grp * 4 + sub_idx);
+                const int8_t* qxb = qx_qs + (size_t)b * 32;
+                const int8x16_t qx0 = vld1q_s8(qxb);
+                const int8x16_t qx1 = vld1q_s8(qxb + 16);
+                const int32_t dot_a = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q6_0, qx0));
+                const int32_t dot_b = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q6_1, qx1));
+
+                const float sc_a = (float)sc_g[sub_idx * 2 + 0];
+                const float sc_b = (float)sc_g[sub_idx * 2 + 1];
+                acc += d * qx_sc[b] * (sc_a * (float)dot_a + sc_b * (float)dot_b);
+            };
+
+            sub.template operator()<0>(ql_lo0, ql_lo1, false, 0);
+            sub.template operator()<2>(ql_hi0, ql_hi1, false, 1);
+            sub.template operator()<4>(ql_lo0, ql_lo1, true,  2);
+            sub.template operator()<6>(ql_hi0, ql_hi1, true,  3);
+        }
+    }
+    return acc;
+}
 #endif
 
 static inline float vec_dot_q6_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
-    // Q6_K 当前仅标量版，性能从 "按行反量化+float乘" 升级为 "整数乘累加"（Phase 5）
-    // 相比 Q8_0/Q4_K NEON 版，速度收益较小，但正确性有保障
+#if defined(__ARM_NEON) && CLLM_HAS_SDOT
+    return vec_dot_q6_k_q8_neon(w, qx, n);
+#else
     return vec_dot_q6_k_q8_scalar(w, qx, n);
+#endif
 }
 
 bool has_vec_dot(GgmlType type) {
