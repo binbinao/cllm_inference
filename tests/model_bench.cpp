@@ -1,9 +1,10 @@
 // 模型级量化对比基准：
-//   对 models/ 下的模型，分别用「反量化 fp32」与「文件名上的量化方法」两种推理路径，
+//   对 models/ 下的模型，分别用「反量化 fp32」「反量化 fp16」与「文件名上的量化方法」三种推理路径，
 //   测试不同输入长度（prompt token 数）下的 prefill 与 decode 耗时，并计算量化加速比。
 //
-//   - 反量化 fp32（use_quant=false）：所有量化权重 dequantize 为 float 常驻，forward 走纯 float 矩阵乘
-//   - 量化方法（use_quant=true）：权重零拷贝引用 mmap，forward 走 vec_dot 整数点积快速路径
+//   - 反量化 fp32（WeightMode::Fp32）：所有量化权重 dequantize 为 float 常驻，forward 走纯 float 矩阵乘
+//   - 反量化 fp16（WeightMode::Fp16）：所有量化权重反量化为 fp16 常驻，forward 走 half->float 矩阵乘
+//   - 量化方法（WeightMode::Quant）：权重零拷贝引用 mmap，forward 走 vec_dot 整数点积快速路径
 //
 // 用法：model_bench [model1 model2 ...]
 //   不带参数时默认测试 models/ 下三个模型（按规模从小到大）。
@@ -58,10 +59,11 @@ struct ModeResult {
 //   token_id       用于构造序列的 token（重复该 token，内容不影响计算量）
 //   prefill_rounds prefill 测量轮数（取最小值，排除冷启动）
 //   decode_steps   prefill 后连续 decode 的步数（取平均）
-ModeResult bench_mode(const GgufModel& model, ThreadPool& pool, bool use_quant,
+ModeResult bench_mode(const GgufModel& model, ThreadPool& pool, WeightMode mode,
+                      const char* mode_name,
                       const std::vector<int>& lens, int token_id,
                       int prefill_rounds, int decode_steps) {
-    TransformerEngine engine(model, pool, use_quant);
+    TransformerEngine engine(model, pool, mode);
     ModeResult r;
     r.prefill_ms.resize(lens.size());
     r.prefill_tok_s.resize(lens.size());
@@ -69,6 +71,8 @@ ModeResult bench_mode(const GgufModel& model, ThreadPool& pool, bool use_quant,
 
     for (size_t li = 0; li < lens.size(); ++li) {
         const int L = lens[li];
+        std::printf("    [%s] prefill %d token...\n", mode_name, L);
+        std::fflush(stdout);
 
         // ---- prefill：reset + 连续 forward L 个 token ----
         // 首轮作为 warmup（冷缓存），不计入；后续取最小耗时
@@ -114,12 +118,12 @@ int main(int argc, char** argv) {
     }
 
     // 不同输入长度（prompt token 数），覆盖短/中/长上下文
-    const std::vector<int> lens = {16, 32, 64, 128, 256};
-    const int prefill_rounds = 2;
+    const std::vector<int> lens = {16, 32, 64, 128};
+    const int prefill_rounds = 1;
     const int decode_steps = 3;
 
     ThreadPool pool(0);
-    std::printf("cllm 模型级量化对比：反量化 fp32  vs  量化（文件名上的量化方法）\n");
+    std::printf("cllm 模型级量化对比：反量化 fp32  vs  反量化 fp16  vs  量化（文件名上的量化方法）\n");
     std::printf("threads=%zu   prefill 取 %d 轮最小，decode 取 %d 步平均\n\n",
                 pool.size(), prefill_rounds, decode_steps);
 
@@ -155,33 +159,53 @@ int main(int argc, char** argv) {
 
         const int token_id = model.bos_id;
 
-        // 两种模式（先 fp32 后量化；fp32 常驻内存较大，测完即释放）
-        auto fp32  = bench_mode(model, pool, false, lens, token_id, prefill_rounds, decode_steps);
-        auto quant = bench_mode(model, pool, true,  lens, token_id, prefill_rounds, decode_steps);
+        // 三种模式（先反量化后量化；fp32/fp16 常驻内存较大，测完即释放）
+        std::printf("  测试 fp32 反量化模式...\n"); std::fflush(stdout);
+        auto fp32  = bench_mode(model, pool, WeightMode::Fp32,  "fp32",  lens, token_id, prefill_rounds, decode_steps);
+        std::printf("  测试 fp16 反量化模式...\n"); std::fflush(stdout);
+        auto fp16  = bench_mode(model, pool, WeightMode::Fp16,  "fp16",  lens, token_id, prefill_rounds, decode_steps);
+        std::printf("  测试量化模式...\n"); std::fflush(stdout);
+        auto quant = bench_mode(model, pool, WeightMode::Quant, "quant", lens, token_id, prefill_rounds, decode_steps);
 
-        std::printf("  %-6s | %12s %12s %8s | %12s %12s %8s\n",
-                    "输入", "fp32 prefill", "quant prefill", "prefill", "fp32 decode", "quant decode", "decode");
-        std::printf("  %-6s | %12s %12s %8s | %12s %12s %8s\n",
-                    "(tok)", "(ms)", "(ms)", "加速x", "(ms)", "(ms)", "加速x");
-        std::printf("  ------+-----------------------------------------+--------------------------------------\n");
+        std::printf("  %-6s | %12s %12s %12s | %12s %12s %12s\n",
+                    "输入", "fp32 prefill", "fp16 prefill", "quant prefill", "fp32 decode", "fp16 decode", "quant decode");
+        std::printf("  %-6s | %12s %12s %12s | %12s %12s %12s\n",
+                    "(tok)", "(ms)", "(ms)", "(ms)", "(ms)", "(ms)", "(ms)");
+        std::printf("  ------+----------------------------------------------+------------------------------------------\n");
         for (size_t i = 0; i < lens.size(); ++i) {
-            double ps = fp32.prefill_ms[i] / quant.prefill_ms[i];
-            double ds = fp32.decode_ms[i] / quant.decode_ms[i];
-            std::printf("  %-6d | %12.3f %12.3f %8.2f | %12.4f %12.4f %8.2f\n",
-                        lens[i], fp32.prefill_ms[i], quant.prefill_ms[i], ps,
-                        fp32.decode_ms[i], quant.decode_ms[i], ds);
+            std::printf("  %-6d | %12.3f %12.3f %12.3f | %12.4f %12.4f %12.4f\n",
+                        lens[i],
+                        fp32.prefill_ms[i], fp16.prefill_ms[i], quant.prefill_ms[i],
+                        fp32.decode_ms[i], fp16.decode_ms[i], quant.decode_ms[i]);
         }
+
         // prefill 吞吐（token/s）
-        std::printf("  prefill 吞吐 fp32→quant (tok/s): ");
+        std::printf("  prefill 吞吐 (tok/s): fp32 / fp16 / quant\n");
         for (size_t i = 0; i < lens.size(); ++i) {
-            std::printf("%s%d:%.0f→%.0f", i ? ", " : "", lens[i],
-                        fp32.prefill_tok_s[i], quant.prefill_tok_s[i]);
+            std::printf("    %d: %.0f / %.0f / %.0f\n", lens[i],
+                        fp32.prefill_tok_s[i], fp16.prefill_tok_s[i], quant.prefill_tok_s[i]);
         }
-        std::printf("\n\n");
+
+        // 加速比汇总（以 fp32 反量化为基准 1.0x）
+        std::printf("  prefill 加速比 (相对 fp32): fp16 / quant\n");
+        for (size_t i = 0; i < lens.size(); ++i) {
+            std::printf("    %d: %.2fx / %.2fx\n", lens[i],
+                        fp32.prefill_ms[i] / fp16.prefill_ms[i],
+                        fp32.prefill_ms[i] / quant.prefill_ms[i]);
+        }
+        std::printf("  decode 加速比 (相对 fp32): fp16 / quant\n");
+        for (size_t i = 0; i < lens.size(); ++i) {
+            std::printf("    %d: %.2fx / %.2fx\n", lens[i],
+                        fp32.decode_ms[i] / fp16.decode_ms[i],
+                        fp32.decode_ms[i] / quant.decode_ms[i]);
+        }
+        std::printf("\n");
         std::fflush(stdout);
     }
 
-    std::printf("注：量化加速比 >1 表示量化快于 fp32。prefill 加速来自 FFN/投影矩阵乘；\n");
-    std::printf("    decode 的 attention 为 float 计算，随序列变长占比上升，故 decode 加速比通常低于 prefill。\n");
+    std::printf("注：加速比 >1 表示该模式快于 fp32 反量化。\n");
+    std::printf("    fp16 反量化将权重常驻内存与带宽减半，通常介于 fp32 与量化之间；\n");
+    std::printf("    量化的加速来自 FFN/投影矩阵乘的整数点积 + 更低带宽；decode 的 attention 为 float 计算，\n");
+    std::printf("    随序列变长占比上升，故 decode 加速比通常低于 prefill。\n");
     return 0;
 }

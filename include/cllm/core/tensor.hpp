@@ -25,6 +25,9 @@ struct Tensor {
 
     // 反量化为 float 向量
     std::vector<float> dequantize() const;
+
+    // 反量化为 fp16 位模式向量（权重常驻半精度，供「反量化 fp16」推理路径使用）
+    std::vector<uint16_t> dequantize_f16() const;
 };
 
 }  // namespace cllm

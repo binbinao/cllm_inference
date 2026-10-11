@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 namespace cllm {
@@ -25,6 +26,66 @@ enum class GgmlType : uint32_t {
     Q6_K = 14,
 };
 
+// IEEE 754 半精度（fp16）位模式 <-> float 转换（用于 fp16 反量化推理路径）
+// inline 定义以便在矩阵乘热循环中内联，避免逐元素函数调用开销。
+inline float half_to_float(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            mant &= 0x3FF;
+            f = (sign << 31) | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        f = (sign << 31) | 0x7F800000 | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &f, sizeof(float));
+    return out;
+}
+
+inline uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(uint32_t));
+
+    uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t mant = x & 0x007FFFFFu;
+    int32_t exp = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+
+    // NaN / Inf
+    if (((x >> 23) & 0xFFu) == 0xFFu) {
+        if (mant) return (uint16_t)(sign | 0x7E00u);  // NaN -> quiet NaN
+        return (uint16_t)(sign | 0x7C00u);            // Inf
+    }
+
+    if (exp >= 0x1F) {
+        return (uint16_t)(sign | 0x7C00u);  // overflow -> Inf
+    }
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;  // underflow -> signed zero
+        mant |= 0x00800000u;                     // implicit leading 1
+        uint32_t t = (uint32_t)(14 - exp);       // shift amount
+        uint32_t a = (1u << (t - 1)) - 1u;       // rounding bias
+        uint32_t b = (mant >> t) & 1u;           // round bit
+        mant = (mant + a + b) >> t;
+        return (uint16_t)(sign | mant);
+    }
+
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
 // 每种类型的块大小（每个 block 包含的元素数）
 int block_size(GgmlType type);
 
@@ -36,6 +97,12 @@ size_t type_size(GgmlType type);
 // n: 元素总数（会按 block 对齐处理）
 // 当前为标量实现，覆盖 GGUF 常用全部类型，入口统一以便后续替换 SIMD 内核。
 void dequantize_block(const void* src, float* dst, GgmlType type, int64_t n);
+
+// 将一段量化数据反量化为 fp16（半精度位模式）。
+// src: 指向量化数据起始位置；dst: 输出 fp16 位模式缓冲（长度 >= n）
+// n: 元素总数（会按 block 对齐处理）
+// 用于「反量化 fp16」推理路径：权重以 fp16 精度常驻，矩阵乘时 half -> float 累加。
+void dequantize_block_f16(const void* src, uint16_t* dst, GgmlType type, int64_t n);
 
 // =========================================================================
 // 量化矩阵乘加速：激活在线量化 + 整数点积

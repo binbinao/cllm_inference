@@ -21,34 +21,6 @@ namespace cllm {
 
 namespace {
 
-// IEEE 754 half precision -> float
-float half_to_float(uint16_t h) {
-    uint32_t sign = (h >> 15) & 0x1;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign << 31;
-        } else {
-            exp = 127 - 15 + 1;
-            while ((mant & 0x400) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x3FF;
-            f = (sign << 31) | (exp << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1F) {
-        f = (sign << 31) | 0x7F800000 | (mant << 13);
-    } else {
-        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float out;
-    std::memcpy(&out, &f, sizeof(float));
-    return out;
-}
-
 // ---- F32 ----
 void deq_f32(const void* src, float* dst, int64_t n) {
     std::memcpy(dst, src, n * sizeof(float));
@@ -415,6 +387,24 @@ void dequantize_block(const void* src, float* dst, GgmlType type, int64_t n) {
 std::vector<float> Tensor::dequantize() const {
     std::vector<float> out(numel());
     dequantize_block(data, out.data(), type, static_cast<int64_t>(numel()));
+    return out;
+}
+
+// 反量化为 fp16 位模式：先反量化为 float，再转为半精度位模式
+void dequantize_block_f16(const void* src, uint16_t* dst, GgmlType type, int64_t n) {
+    // F16 源本身就是半精度位模式，直接拷贝
+    if (type == GgmlType::F16) {
+        std::memcpy(dst, src, (size_t)n * sizeof(uint16_t));
+        return;
+    }
+    std::vector<float> buf(static_cast<size_t>(n));
+    dequantize_block(src, buf.data(), type, n);
+    for (int64_t i = 0; i < n; ++i) dst[i] = float_to_half(buf[i]);
+}
+
+std::vector<uint16_t> Tensor::dequantize_f16() const {
+    std::vector<uint16_t> out(numel());
+    dequantize_block_f16(data, out.data(), type, static_cast<int64_t>(numel()));
     return out;
 }
 
