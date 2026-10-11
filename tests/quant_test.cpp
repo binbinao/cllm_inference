@@ -233,7 +233,7 @@ void test_unsupported() {
 }
 
 // ---- matmul_quant：与「反量化 + float 点积」参考实现逐元素比对 ----
-// 对所有已注册 vec_dot 快路径的类型（Q8_0/Q4_K/Q6_K）均校验
+// 对所有已注册 vec_dot 快路径的类型（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K）均校验
 void test_matmul_quant_type(const char* name, GgmlType type) {
     std::printf("[matmul_quant %s]\n", name);
     const int bs = block_size(type);
@@ -282,8 +282,11 @@ void test_matmul_quant_type(const char* name, GgmlType type) {
 }
 
 void test_matmul_quant() {
+    test_matmul_quant_type("Q4_0", GgmlType::Q4_0);
+    test_matmul_quant_type("Q5_0", GgmlType::Q5_0);
     test_matmul_quant_type("Q8_0", GgmlType::Q8_0);
     test_matmul_quant_type("Q4_K", GgmlType::Q4_K);
+    test_matmul_quant_type("Q5_K", GgmlType::Q5_K);
     test_matmul_quant_type("Q6_K", GgmlType::Q6_K);
 
     // bias 生效验证（Q8_0）

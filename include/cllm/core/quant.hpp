@@ -59,7 +59,7 @@ struct QuantizedQ8_0 {
 // 将 float 向量量化为 Q8_0 格式（block=32，absmax scale）
 void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n);
 
-// 查询某种权重量化类型是否有 vec_dot 快速路径（当前支持 Q8_0 / Q4_K / Q6_K）
+// 查询某种权重量化类型是否有 vec_dot 快速路径（当前支持 Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K）
 bool has_vec_dot(GgmlType type);
 
 // 对单行权重做 "量化激活 · 量化权重" 的整数点积，返回 float 累加结果。

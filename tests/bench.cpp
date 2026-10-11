@@ -117,6 +117,7 @@ int main(int argc, char** argv) {
         {"F16",  GgmlType::F16,  16},
         {"Q8_0", GgmlType::Q8_0,  8},
         {"Q6_K", GgmlType::Q6_K,  6},
+        {"Q5_K", GgmlType::Q5_K,  5},
         {"Q5_0", GgmlType::Q5_0,  5},
         {"Q4_K", GgmlType::Q4_K,  4},
         {"Q4_0", GgmlType::Q4_0,  4},
