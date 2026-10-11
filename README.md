@@ -18,7 +18,7 @@
 - **多格式对话模板**：自动识别 ChatML（Qwen）/ Llama 3 / Llama 2·Mistral 并应用对应模板
 - **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
 - **内置 Web UI**：单文件 HTML 对话前端，支持流式输出、模型库浏览与启动命令生成（Qwen/Llama ≤30B）
-- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 140 项断言，含量化吞吐基准与模型级「量化 vs fp32」对比基准
+- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 140 项断言，含量化吞吐基准与模型级「量化 vs 反量化 fp32/fp16」三模式对比基准
 
 ---
 
@@ -239,7 +239,7 @@ make bench
 - **覆盖范围**：13 种 GGML 量化类型反量化、`matmul_quant` 内核（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 均对比 float 参考路径）、
   线程池并行一致性、采样器 greedy/top-k/top-p/温度行为，共 **140+ 项断言**。
 - **基准**：`tests/bench.cpp` 报告各量化类型的 GFLOP/s 及相对纯 float matmul 的比值；
-  `tests/model_bench.cpp` 对真实模型做「量化 vs 反量化 fp32」的 prefill/decode 对比（见下文）。
+  `tests/model_bench.cpp` 对真实模型做「量化 vs 反量化 fp32/fp16」的 prefill/decode 对比（见下文）。
 - CMake 构建下：`cmake --build build && ctest --test-dir build`。
 
 ### 性能基准（Apple M4，`in=1024 out=1024`）
@@ -279,12 +279,17 @@ make bench
 > 端到端因模型架构/参数量/FFN 宽度不同（如 Qwen2.5-0.5B 的 n_ff=4864 远大于 Qwen3-0.6B 的 3072），
 > **不适合**用于量化位数的公平对齐，公平对齐应使用上表统一维度的 micro-benchmark。
 
-### 模型级量化 vs 反量化 fp32 对比
+### 模型级量化 vs 反量化 fp32/fp16 对比
 
-`tests/model_bench.cpp` 对真实模型分别用两种推理路径（`TransformerEngine` 的 `use_quant` 开关控制）：
+`tests/model_bench.cpp` 对真实模型分别用三种推理路径（`TransformerEngine` 的 `WeightMode` 枚举控制，
+默认 `WeightMode::Quant`）：
 
-- **反量化 fp32**（`use_quant=false`）：量化权重 `dequantize()` 为 fp32 常驻，forward 走纯 float 矩阵乘
-- **量化**（`use_quant=true`）：权重零拷贝引用 mmap，forward 走 vec_dot 整数点积快速路径
+- **反量化 fp32**（`WeightMode::Fp32`）：量化权重 `dequantize()` 为 fp32 常驻，forward 走纯 float 矩阵乘
+- **反量化 fp16**（`WeightMode::Fp16`）：量化权重 `dequantize_f16()` 为半精度位模式常驻，forward 时逐元素 half→float 累加
+- **量化**（`WeightMode::Quant`，默认）：权重零拷贝引用 mmap，forward 走 vec_dot 整数点积快速路径
+
+> 默认开启量化增强：CLI（`main.cpp`）与 HTTP 服务均以 `WeightMode::Quant` 构造 `TransformerEngine`，
+> 走整数点积 + 零拷贝 mmap 的快速路径，性能最优。fp32/fp16 反量化路径仅用于公平性能对比与数值验证。
 
 实测（Apple M4，10 线程，输入长度 16/32/64/128/256 token）：
 
@@ -298,8 +303,19 @@ make bench
 
 - 量化相对 fp32 的 **prefill 加速稳定在 3~7x**，主要来自 FFN/投影矩阵乘的整数点积 + 更低内存带宽。
 - **decode 加速比波动更大**（3~13x），因为 decode 的 attention 为 float 计算、不受量化影响，且随序列变长占比上升。
+- ⚠️ **fp16 反量化路径通常比 fp32 更慢**：在缺乏硬件 fp16 加速的 x86 平台上，`half_to_float` 为纯软件位运算，
+  每个乘加都要先转换，其 ALU 开销超过权重带宽减半的收益（见下方 Linux x86 实测）。
 - ⚠️ **文件名可能与实际量化不符**：`qwen2.5-0.5b-instruct-q4_k_m.gguf` 的实际主体是 **Q5_0（61.6%）**，
   并非文件名标注的 Q4_K_M。`model_bench` 会打印每个模型的真实量化类型分布（按参数量加权），便于识别。
+
+补充实测（Linux x86_64，8 核，`-O3 -march=native`，Qwen3-0.6B-Q8_0，模型级三模式对比）：
+
+| 指标 | fp32 反量化 | fp16 反量化 | 量化 (Quant, 默认) |
+|------|-----------|-----------|-------------------|
+| prefill 128 token (ms) | 27894.6 | 33684.0 | **4854.1** |
+| decode 128 token (ms) | 227.5 | 278.3 | **43.6** |
+
+量化默认路径相对反量化方法 prefill 快约 **6x**、decode 快约 **5~6.7x**，且 fp16 反量化略慢于 fp32（约 0.83x）。
 
 用法：
 
