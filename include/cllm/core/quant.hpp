@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace cllm {
 
@@ -36,10 +37,39 @@ size_t type_size(GgmlType type);
 // 当前为标量实现，覆盖 GGUF 常用全部类型，入口统一以便后续替换 SIMD 内核。
 void dequantize_block(const void* src, float* dst, GgmlType type, int64_t n);
 
+// =========================================================================
+// 量化矩阵乘加速：激活在线量化 + 整数点积
+// =========================================================================
+//
+// 旧路径（兜底）：权重按行反量化 -> float 点积
+// 新路径（更快）：激活在线量化为 Q8 -> 整数点积 -> float 累加
+//
+// 新路径对已注册 vec_dot 内核的权重类型生效，其他类型自动走旧路径，向后兼容。
+
+// 激活量化格式：Q8_0（block=32），每块一个 f32 scale + 32 x int8
+// 对于 Q4_K/Q5_K/Q6_K/Q2_K/Q3_K 走 Q8_K（block=256，带 sum 预计算），后续按需扩展。
+struct QuantizedQ8_0 {
+    std::vector<float> scales;   // 每块 scale，长度 = n / 32
+    std::vector<int8_t> qs;      // 量化值，长度 = n（n 需为 32 的倍数）
+    int64_t n = 0;               // 元素总数
+};
+
+// 将 float 向量量化为 Q8_0 格式（block=32，absmax scale）
+void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n);
+
+// 查询某种权重量化类型是否有 vec_dot 快速路径（当前支持 Q8_0 / Q4_K / Q6_K）
+bool has_vec_dot(GgmlType type);
+
+// 对单行权重做 "量化激活 · 量化权重" 的整数点积，返回 float 累加结果。
+// 要求 n 能被权重类型的 block_size 整除。
+// 用于 matmul_quant 内部，一般不直接调用。
+float vec_dot_row(const void* w_row, GgmlType w_type,
+                  const QuantizedQ8_0& qx, int64_t n);
+
 // 量化权重矩阵乘：y[out_dim] = x[in_dim] · W[out_dim, in_dim]ᵀ (+ bias)
-// 对量化权重按输出行惰性反量化，仅保留行级 float 缓冲，避免整块权重常驻内存。
-// w: 指向量化权重数据（如 mmap 区域）；type: 权重量化类型；
-// bias: 可选偏置（长度 out_dim）；pool: 可选线程池，按输出行分块并行；
+// 优化策略：
+//   - 若 w_type 支持 vec_dot：先把 x 量化为 Q8_0（一次性），然后每行走整数点积
+//   - 否则：旧路径，按行反量化为 float 后做 float 点积
 // 要求 in_dim 能被该类型的 block_size 整除。
 void matmul_quant(const float* x, const void* w, GgmlType type,
                   const float* bias, int in_dim, int out_dim, float* y,

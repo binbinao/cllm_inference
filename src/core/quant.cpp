@@ -2,6 +2,8 @@
 #include "cllm/core/tensor.hpp"
 #include "cllm/core/thread_pool.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -406,6 +408,83 @@ std::vector<float> Tensor::dequantize() const {
     return out;
 }
 
+// =========================================================================
+// 激活量化 + 整数点积快路径
+// =========================================================================
+
+// 将 float 向量量化为 Q8_0（block=32，absmax scale）
+void quantize_row_q8_0(const float* x, QuantizedQ8_0& out, int64_t n) {
+    constexpr int QK8 = 32;
+    if (n % QK8 != 0) {
+        throw std::runtime_error("quantize_row_q8_0: n not divisible by 32");
+    }
+    const int64_t nb = n / QK8;
+    out.n = n;
+    out.scales.resize(nb);
+    out.qs.resize(n);
+    for (int64_t b = 0; b < nb; ++b) {
+        const float* xb = x + b * QK8;
+        float amax = 0.0f;
+        for (int j = 0; j < QK8; ++j) {
+            float a = std::fabs(xb[j]);
+            if (a > amax) amax = a;
+        }
+        const float d = amax / 127.0f;
+        const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+        out.scales[b] = d;
+        int8_t* qb = out.qs.data() + b * QK8;
+        for (int j = 0; j < QK8; ++j) {
+            float v = xb[j] * id;
+            // 四舍五入到 int8；绝对值不超过 127
+            int q = (int)std::nearbyint(v);
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            qb[j] = (int8_t)q;
+        }
+    }
+}
+
+// Q8_0 × Q8_0 vec_dot（标量版）
+// 权重块布局：[d_w:f16][qs_w:32 x int8] -> block_size=32, type_size=34
+// 激活块布局：Q8_0_act = [d_x:f32] + [qs_x:32 x int8]（存储于 QuantizedQ8_0 的两个独立数组）
+// 单块贡献：d_w * d_x * dot_int32(qs_w, qs_x)
+static float vec_dot_q8_0_q8_0_scalar(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 32;
+    const int64_t nb = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    float acc = 0.0f;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d_w = half_to_float(*reinterpret_cast<const uint16_t*>(w));
+        const int8_t* qw = reinterpret_cast<const int8_t*>(w + 2);
+        const int8_t* qxb = qx_qs + b * QK;
+        int32_t sum = 0;
+        for (int j = 0; j < QK; ++j) sum += (int32_t)qw[j] * (int32_t)qxb[j];
+        acc += d_w * qx_sc[b] * (float)sum;
+        w += 34;  // d:f16(2B) + qs:int8(32B)
+    }
+    return acc;
+}
+
+// --- 导出接口 ---
+
+bool has_vec_dot(GgmlType type) {
+    switch (type) {
+        case GgmlType::Q8_0: return true;
+        default: return false;
+    }
+}
+
+float vec_dot_row(const void* w_row, GgmlType w_type,
+                  const QuantizedQ8_0& qx, int64_t n) {
+    const uint8_t* w = static_cast<const uint8_t*>(w_row);
+    switch (w_type) {
+        case GgmlType::Q8_0: return vec_dot_q8_0_q8_0_scalar(w, qx, n);
+        default:
+            throw std::runtime_error("vec_dot_row: no kernel for this type");
+    }
+}
+
 void matmul_quant(const float* x, const void* w, GgmlType type,
                   const float* bias, int in_dim, int out_dim, float* y,
                   ThreadPool* pool) {
@@ -416,6 +495,27 @@ void matmul_quant(const float* x, const void* w, GgmlType type,
     const size_t row_bytes = (size_t)(in_dim / bs) * type_size(type);
     const uint8_t* base = static_cast<const uint8_t*>(w);
 
+    // ---- 快路径：激活量化 + 整数点积（针对已注册 vec_dot 的权重类型）----
+    if (has_vec_dot(type)) {
+        QuantizedQ8_0 qx;
+        quantize_row_q8_0(x, qx, in_dim);
+        auto row_fast = [&](int j) {
+            const void* rp = base + (size_t)j * row_bytes;
+            float acc = vec_dot_row(rp, type, qx, in_dim);
+            if (bias) acc += bias[j];
+            y[j] = acc;
+        };
+        if (pool && out_dim >= 256) {
+            pool->parallel_for(0, (size_t)out_dim, [&](size_t b, size_t e) {
+                for (size_t j = b; j < e; ++j) row_fast((int)j);
+            });
+        } else {
+            for (int j = 0; j < out_dim; ++j) row_fast(j);
+        }
+        return;
+    }
+
+    // ---- 兜底路径：按行反量化为 float 后做 float 点积 ----
     // 分块融合：按 cache 友好的粒度反量化并立即累加，避免整行 float 缓冲的完整往返。
     // 块长对齐到该类型的 block size。
     const int CHUNK = 512;
