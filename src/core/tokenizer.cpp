@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -84,51 +83,121 @@ std::unordered_map<uint32_t, uint8_t> build_unicode_to_bytes() {
 }
 }  // namespace
 
+namespace {
+int utf8_seq_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+}  // namespace
+
+std::string Utf8StreamDecoder::feed(std::string_view bytes) {
+    buf_.append(bytes.data(), bytes.size());
+    std::string out;
+    size_t i = 0;
+    while (i < buf_.size()) {
+        unsigned char c = static_cast<unsigned char>(buf_[i]);
+        int need = utf8_seq_len(c);
+        if (i + static_cast<size_t>(need) > buf_.size()) break;
+        out.append(buf_.data() + i, static_cast<size_t>(need));
+        i += static_cast<size_t>(need);
+    }
+    buf_.erase(0, i);
+    return out;
+}
+
+std::string Utf8StreamDecoder::flush() {
+    std::string out = std::move(buf_);
+    buf_.clear();
+    return out;
+}
+
 Tokenizer::Tokenizer(const GgufModel& model)
     : tokens_(model.tokens), bos_id_(model.bos_id), eos_id_(model.eos_id) {
     is_gpt2_ = (model.tokenizer_model == "gpt2");
     add_bos_token_ = model.add_bos_token;
     has_chat_template_ = !model.chat_template.empty();
     chat_template_ = model.chat_template;
-    // 记录识别到的模板格式（用于诊断）
+    token_to_id_.reserve(tokens_.size());
+    for (size_t i = 0; i < tokens_.size(); ++i) {
+        token_to_id_.emplace(tokens_[i], static_cast<int>(i));
+    }
+    if (eos_id_ >= 0) stop_ids_.insert(eos_id_);
+    for (const char* name : {"<|im_end|>", "<|eot_id|>", "<|end_of_text|>"}) {
+        int id = find_token(name);
+        if (id >= 0) stop_ids_.insert(id);
+    }
     if (!chat_template_.empty()) {
         if (chat_template_.find("<|im_start|>") != std::string::npos) chat_template_format_ = "chatml";
         else if (chat_template_.find("<|start_header_id|>") != std::string::npos) chat_template_format_ = "llama3";
         else if (chat_template_.find("[INST]") != std::string::npos) chat_template_format_ = "llama2";
         else chat_template_format_ = "unknown";
     }
-    // BPE 合并排名：rank = 索引（越靠前优先级越高）
     for (size_t i = 0; i < model.merges.size(); ++i) {
         merges_rank_[model.merges[i]] = (int)i;
     }
 }
 
+bool Tokenizer::is_eos(int token_id) const {
+    return stop_ids_.count(token_id) != 0;
+}
+
 std::vector<int> Tokenizer::apply_chat_template(const std::string& user_message,
                                                 const std::string& system_message) const {
-    // 依据词表中实际存在的特殊 token 分派模板格式，避免仅支持单一格式导致静默退化。
+    std::vector<ChatMessage> msgs;
+    if (!system_message.empty()) msgs.push_back({"system", system_message});
+    msgs.push_back({"user", user_message});
+    return apply_chat_template(msgs);
+}
+
+std::vector<int> Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages) const {
     const int im_start = find_token("<|im_start|>");
     const int im_end   = find_token("<|im_end|>");
 
-    // 换行与普通文本一律走 encode，避免 bytes_to_unicode 映射差异
     auto push_text = [&](std::vector<int>& ids, const std::string& text) {
         auto part = encode(text, false);
         ids.insert(ids.end(), part.begin(), part.end());
     };
 
-    // ---- 格式 1：ChatML（Qwen 系列）----
+    std::string system;
+    for (const auto& m : messages) {
+        if (m.role == "system" && system.empty()) system = m.content;
+    }
+
     if (im_start >= 0 && im_end >= 0) {
-        std::string sys = system_message;
-        if (sys.empty()) {
-            sys = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+        if (system.empty()) {
+            system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
         }
         std::vector<int> ids;
-        ids.push_back(im_start); push_text(ids, "system\n" + sys); ids.push_back(im_end); push_text(ids, "\n");
-        ids.push_back(im_start); push_text(ids, "user\n" + user_message); ids.push_back(im_end); push_text(ids, "\n");
-        ids.push_back(im_start); push_text(ids, "assistant\n");
+        bool wrote_system = false;
+        for (const auto& m : messages) {
+            std::string role = m.role;
+            std::string content = m.content;
+            if (role == "system") {
+                if (wrote_system) continue;
+                content = system;
+                wrote_system = true;
+            }
+            ids.push_back(im_start);
+            push_text(ids, role + "\n" + content);
+            ids.push_back(im_end);
+            push_text(ids, "\n");
+        }
+        if (!wrote_system) {
+            std::vector<int> head;
+            head.push_back(im_start);
+            push_text(head, "system\n" + system);
+            head.push_back(im_end);
+            push_text(head, "\n");
+            ids.insert(ids.begin(), head.begin(), head.end());
+        }
+        ids.push_back(im_start);
+        push_text(ids, "assistant\n");
         return ids;
     }
 
-    // ---- 格式 2：Llama 3（<|start_header_id|>role<|end_header_id|>\n\n...<|eot_id|>）----
     const int sh = find_token("<|start_header_id|>");
     const int eh = find_token("<|end_header_id|>");
     const int eot = find_token("<|eot_id|>");
@@ -142,31 +211,48 @@ std::vector<int> Tokenizer::apply_chat_template(const std::string& user_message,
         };
         const int bot = find_token("<|begin_of_text|>");
         if (bot >= 0) ids.push_back(bot);
-        if (!system_message.empty()) { header("system"); push_text(ids, system_message); ids.push_back(eot); }
-        header("user"); push_text(ids, user_message); ids.push_back(eot);
+        for (const auto& m : messages) {
+            header(m.role);
+            push_text(ids, m.content);
+            ids.push_back(eot);
+        }
         header("assistant");
         return ids;
     }
 
-    // ---- 格式 3：Llama 2 / Mistral（[INST] ... [/INST]）----
     const int binst = find_token("[INST]");
-    if (binst >= 0 && find_token("[/INST]") >= 0) {
+    const int einst = find_token("[/INST]");
+    if (binst >= 0 && einst >= 0) {
         std::vector<int> ids;
         if (bos_id_ >= 0 && add_bos_token_) ids.push_back(bos_id_);
-        ids.push_back(binst);
-        if (!system_message.empty()) push_text(ids, " " + system_message + " ");
-        push_text(ids, user_message);
-        push_text(ids, " [/INST]");
+        bool first_user = true;
+        for (const auto& m : messages) {
+            if (m.role == "system") continue;
+            if (m.role == "user") {
+                ids.push_back(binst);
+                if (first_user && !system.empty()) push_text(ids, " " + system + " ");
+                first_user = false;
+                push_text(ids, m.content);
+                push_text(ids, " [/INST]");
+            } else if (m.role == "assistant") {
+                push_text(ids, m.content);
+            }
+        }
         return ids;
     }
 
-    // ---- 回退：无已知模板格式时按普通文本编码 ----
-    return encode(user_message, add_bos_token_);
+    std::string joined;
+    for (const auto& m : messages) {
+        if (m.role == "system") continue;
+        if (!joined.empty()) joined += "\n";
+        joined += m.content;
+    }
+    return encode(joined, add_bos_token_);
 }
 
 int Tokenizer::find_token(const std::string& s) const {
-    auto it = std::find(tokens_.begin(), tokens_.end(), s);
-    if (it != tokens_.end()) return (int)(it - tokens_.begin());
+    auto it = token_to_id_.find(s);
+    if (it != token_to_id_.end()) return it->second;
     return -1;
 }
 
