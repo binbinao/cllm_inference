@@ -754,9 +754,34 @@ static float vec_dot_q4_0_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int
 }
 #endif
 
+#if defined(__AVX2__)
+static float vec_dot_q4_0_q8_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 32;
+    const int64_t nb = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    float acc = 0.0f;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* qs = w; w += 16;
+        __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+        __m128i lo = _mm_and_si128(raw, mask_lo);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
+        __m256i q4 = _mm256_set_m128i(hi, lo);
+        const int32_t dot = avx2_dot_u8_s8(q4, qx_qs + (size_t)b * QK);
+        acc += d * qx_sc[b] * ((float)dot - 8.0f * (float)qx_bs[b]);
+    }
+    return acc;
+}
+#endif
+
 static inline float vec_dot_q4_0_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q4_0_q8_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q4_0_q8_avx2(w, qx, n);
 #else
     return vec_dot_q4_0_q8_scalar(w, qx, n);
 #endif
@@ -835,9 +860,44 @@ static float vec_dot_q5_0_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int
 }
 #endif
 
+#if defined(__AVX2__)
+static float vec_dot_q5_0_q8_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 32;
+    const int64_t nb = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    float acc = 0.0f;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* qh = w; w += 4;
+        const uint8_t* qs = w; w += 16;
+        const uint32_t qh_bits = (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) |
+                                 ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
+        __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+        __m128i lo4 = _mm_and_si128(raw, mask_lo);
+        __m128i hi4 = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
+        alignas(16) uint8_t hi_lo[16], hi_hi[16];
+        for (int j = 0; j < 16; ++j) {
+            hi_lo[j] = (uint8_t)(((qh_bits >> j) & 1) << 4);
+            hi_hi[j] = (uint8_t)(((qh_bits >> (j + 16)) & 1) << 4);
+        }
+        __m128i q5lo = _mm_or_si128(lo4, _mm_load_si128(reinterpret_cast<const __m128i*>(hi_lo)));
+        __m128i q5hi = _mm_or_si128(hi4, _mm_load_si128(reinterpret_cast<const __m128i*>(hi_hi)));
+        __m256i q5 = _mm256_set_m128i(q5hi, q5lo);
+        const int32_t dot = avx2_dot_u8_s8(q5, qx_qs + (size_t)b * QK);
+        acc += d * qx_sc[b] * ((float)dot - 16.0f * (float)qx_bs[b]);
+    }
+    return acc;
+}
+#endif
+
 static inline float vec_dot_q5_0_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q5_0_q8_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q5_0_q8_avx2(w, qx, n);
 #else
     return vec_dot_q5_0_q8_scalar(w, qx, n);
 #endif

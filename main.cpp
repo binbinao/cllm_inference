@@ -1,7 +1,10 @@
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <string>
+#include <vector>
 
 #include "cllm/core/engine.hpp"
 #include "cllm/core/gguf.hpp"
@@ -20,9 +23,12 @@ void print_usage() {
         "  --prompt <text>      Run local generation with this prompt\n"
         "  --port <n>           HTTP server port (default 8080)\n"
         "  --threads <n>        Number of CPU threads (default: hardware concurrency)\n"
+        "  --ctx <n>            Cap context / KV hard limit (default: model n_ctx)\n"
         "  --temperature <f>    Sampling temperature (default 0.8)\n"
         "  --top-p <f>          Top-p (nucleus) sampling (default 0.9)\n"
         "  --top-k <n>          Top-k sampling (default 40)\n"
+        "  --seed <n>           RNG seed (default: random)\n"
+        "  --stop <str>         Stop suffix (repeatable)\n"
         "  --max-tokens <n>     Max tokens to generate (default 64)\n";
 }
 
@@ -35,6 +41,10 @@ int main(int argc, char** argv) {
     size_t threads = 0;
     cllm::SampleParams sp;
     int max_tokens = 64;
+    int ctx_limit = 0;
+    uint32_t seed = 0;
+    bool has_seed = false;
+    std::vector<std::string> stops;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -46,6 +56,9 @@ int main(int argc, char** argv) {
         else if (arg == "--prompt") prompt = next("--prompt");
         else if (arg == "--port") port = (uint16_t)std::stoi(next("--port"));
         else if (arg == "--threads") threads = (size_t)std::stoi(next("--threads"));
+        else if (arg == "--ctx") ctx_limit = std::stoi(next("--ctx"));
+        else if (arg == "--seed") { seed = (uint32_t)std::stoul(next("--seed")); has_seed = true; }
+        else if (arg == "--stop") stops.push_back(next("--stop"));
         else if (arg == "--temperature") sp.temperature = std::stof(next("--temperature"));
         else if (arg == "--top-p") sp.top_p = std::stof(next("--top-p"));
         else if (arg == "--top-k") sp.top_k = std::stoi(next("--top-k"));
@@ -65,6 +78,9 @@ int main(int argc, char** argv) {
         auto model = cllm::GgufLoader::load(model_path);
         const auto& cfg = model.config;
 
+        const uint32_t model_ctx = cfg.n_ctx;
+        cllm::ThreadPool pool(threads);
+        cllm::TransformerEngine engine(model, pool, cllm::WeightMode::Quant, ctx_limit);
         std::cout << "Loaded model: " << model_path << "\n"
                   << "  architecture: " << cfg.arch << "\n"
                   << "  layers: " << cfg.n_layers
@@ -72,11 +88,8 @@ int main(int argc, char** argv) {
                   << ", heads: " << cfg.n_head
                   << " (kv: " << cfg.n_head_kv << ")\n"
                   << "  vocab: " << cfg.vocab_size
-                  << ", ctx: " << cfg.n_ctx << "\n"
+                  << ", ctx: " << engine.config().n_ctx << "/" << model_ctx << "\n"
                   << std::flush;
-
-        cllm::ThreadPool pool(threads);
-        cllm::TransformerEngine engine(model, pool);
         cllm::Tokenizer tokenizer(model);
 
         if (!prompt.empty()) {
@@ -87,7 +100,9 @@ int main(int argc, char** argv) {
             } else {
                 ids = tokenizer.encode(prompt, model.add_bos_token);
             }
-            std::mt19937 rng(std::random_device{}());
+            std::mt19937 rng;
+            if (has_seed) rng.seed(seed);
+            else rng.seed(std::random_device{}());
 
             using clock = std::chrono::steady_clock;
             const auto t0 = clock::now();
@@ -97,15 +112,35 @@ int main(int argc, char** argv) {
             cllm::Utf8StreamDecoder dec;
             std::cout << "\n" << prompt;
             int n_gen = 0;
+            std::string generated;
             for (int i = 0; i < max_tokens; ++i) {
                 int next = cllm::Sampler::sample(logits, sp, rng);
                 if (tokenizer.is_eos(next)) break;
                 ids.push_back(next);
                 ++n_gen;
-                std::cout << dec.feed(tokenizer.decode(next)) << std::flush;
+                std::string piece = dec.feed(tokenizer.decode(next));
+                generated += piece;
+                std::string stripped;
+                if (cllm::consume_stop_suffix(generated, stops, stripped)) {
+                    const size_t extra = generated.size() - stripped.size();
+                    if (extra <= piece.size()) std::cout << piece.substr(0, piece.size() - extra);
+                    else std::cout << piece;
+                    std::cout << std::flush;
+                    break;
+                }
+                std::cout << piece << std::flush;
                 logits = engine.forward(next);
             }
-            std::cout << dec.flush() << "\n";
+            std::string tail = dec.flush();
+            generated += tail;
+            std::string stripped;
+            if (cllm::consume_stop_suffix(generated, stops, stripped)) {
+                const size_t extra = generated.size() - stripped.size();
+                if (extra <= tail.size()) std::cout << tail.substr(0, tail.size() - extra);
+            } else {
+                std::cout << tail;
+            }
+            std::cout << "\n";
             const auto t2 = clock::now();
 
             auto ms = [](clock::time_point a, clock::time_point b) {

@@ -7,6 +7,13 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace cllm {
 
 namespace {
@@ -49,6 +56,65 @@ void apply_rope(float* q, int n_head, int head_dim, int pos, float rope_theta) {
     }
 }
 
+#if defined(__AVX2__)
+inline float dot_f32(const float* a, const float* b, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_loadu_ps(a + d),
+                                               _mm256_loadu_ps(b + d)));
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float sum = _mm_cvtss_f32(s);
+    for (; d < n; ++d) sum += a[d] * b[d];
+    return sum;
+}
+
+inline void axpy_f32(float* y, const float* x, float a, int n) {
+    const __m256 av = _mm256_set1_ps(a);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        _mm256_storeu_ps(y + d, _mm256_add_ps(_mm256_loadu_ps(y + d),
+                                              _mm256_mul_ps(av, _mm256_loadu_ps(x + d))));
+    }
+    for (; d < n; ++d) y[d] += a * x[d];
+}
+#elif defined(__ARM_NEON)
+inline float dot_f32(const float* a, const float* b, int n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        acc = vmlaq_f32(acc, vld1q_f32(a + d), vld1q_f32(b + d));
+    }
+    float sum = vaddvq_f32(acc);
+    for (; d < n; ++d) sum += a[d] * b[d];
+    return sum;
+}
+
+inline void axpy_f32(float* y, const float* x, float a, int n) {
+    const float32x4_t av = vdupq_n_f32(a);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        vst1q_f32(y + d, vmlaq_f32(vld1q_f32(y + d), av, vld1q_f32(x + d)));
+    }
+    for (; d < n; ++d) y[d] += a * x[d];
+}
+#else
+inline float dot_f32(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int d = 0; d < n; ++d) s += a[d] * b[d];
+    return s;
+}
+
+inline void axpy_f32(float* y, const float* x, float a, int n) {
+    for (int d = 0; d < n; ++d) y[d] += a * x[d];
+}
+#endif
+
 // GQA Attention：q[n_head*head_dim] 对历史 KV 计算加权输出
 void attention(const float* q,
                const std::vector<float>& kc, const std::vector<float>& vc,
@@ -66,9 +132,7 @@ void attention(const float* q,
         float max_s = -INFINITY;
         for (int t = 0; t < seq; ++t) {
             const float* kh = kc.data() + t * (n_head_kv * head_dim) + kv_h * head_dim;
-            float s = 0.0f;
-            for (int d = 0; d < head_dim; ++d) s += qh[d] * kh[d];
-            s *= scale;
+            float s = dot_f32(qh, kh, head_dim) * scale;
             scores[t] = s;
             if (s > max_s) max_s = s;
         }
@@ -76,8 +140,7 @@ void attention(const float* q,
         for (int t = 0; t < seq; ++t) { scores[t] = std::exp(scores[t] - max_s); sum += scores[t]; }
         for (int t = 0; t < seq; ++t) {
             const float* vh = vc.data() + t * (n_head_kv * head_dim) + kv_h * head_dim;
-            float a = scores[t] / sum;
-            for (int d = 0; d < head_dim; ++d) oh[d] += a * vh[d];
+            axpy_f32(oh, vh, scores[t] / sum, head_dim);
         }
     }
 }
@@ -284,9 +347,14 @@ struct TransformerEngine::Impl {
     }
 };
 
-TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool, WeightMode mode)
+TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool, WeightMode mode,
+                                     int ctx_limit)
     : impl_(std::make_unique<Impl>()) {
     auto& c = impl_->cfg = model.config;
+    if (ctx_limit > 0) {
+        const uint32_t cap = static_cast<uint32_t>(ctx_limit);
+        if (c.n_ctx == 0 || c.n_ctx > cap) c.n_ctx = cap;
+    }
     impl_->pool = &pool;
     impl_->model = &model;
     impl_->mode = mode;
@@ -316,7 +384,8 @@ TransformerEngine::TransformerEngine(const GgufModel& model, ThreadPool& pool, W
     impl_->k_cache.resize(c.n_layers);
     impl_->v_cache.resize(c.n_layers);
     {
-        const size_t kv_elems = (size_t)c.n_ctx * (size_t)c.n_head_kv * (size_t)impl_->head_dim;
+        const uint32_t reserve_tok = (c.n_ctx == 0) ? 0u : std::min(c.n_ctx, 4096u);
+        const size_t kv_elems = (size_t)reserve_tok * (size_t)c.n_head_kv * (size_t)impl_->head_dim;
         for (uint32_t l = 0; l < c.n_layers; ++l) {
             impl_->k_cache[l].reserve(kv_elems);
             impl_->v_cache[l].reserve(kv_elems);

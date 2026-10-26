@@ -11,9 +11,11 @@
 - **完整 GGUF 解析**：支持 GGUF v2/v3，mmap 零拷贝加载
 - **量化类型全覆盖**：支持 F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K 共 13 种 GGML 量化格式
 - **零拷贝量化推理**：量化权重直接引用 mmap 数据，按输出行惰性反量化，无需加载期全量展开为 float32（0.5B Q4_K_M 常驻内存 ~430MB）
-- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 vec_dot；Apple Silicon 用 ARMv8.2 SDOT NEON，x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 走 AVX2；相对「反量化 + float matmul」**3-7x**
+- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 vec_dot；Apple Silicon 用 ARMv8.2 SDOT NEON，x86_64 上 Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 AVX2；相对「反量化 + float matmul」**3-7x**
 - **Prefix Cache + batched prefill**：多轮复用公共前缀 KV；新后缀按权重静止批量矩阵乘，仅最后一枚 token 算输出层
-- **上下文硬限制**：超过模型 `n_ctx` 明确报错；KV 按上下文长度预留，避免 GB 级扩容拷贝
+- **上下文硬限制**：`--ctx` 可把硬帽压到 `min(模型 n_ctx, N)`；超过明确报错。KV 最多按 4096 token 预留，避免按 32k–40k 空占数 GB
+- **mmap 预热**：加载后 `madvise(MADV_WILLNEED)`，减轻 30B 首次 prefill 缺页
+- **stop / seed**：CLI `--stop` / `--seed`，HTTP `stop`（字符串或数组）与 `seed`；生成文本后缀匹配即停
 - **通用 Transformer 内核**：RMSNorm、NEOX RoPE、GQA Attention、SwiGLU FFN、KV Cache
 - **CPU 多线程**：手写线程池，按行/分块并行矩阵乘
 - **分词与采样**：BPE + SentencePiece，词表哈希 O(1) 查找；temperature / top-p / top-k
@@ -146,6 +148,9 @@ cllm_inference --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
 
 # 指定线程数（结束后打印 prefill / decode tok/s）
 cllm_inference --model models/xxx.gguf --prompt "你好" --threads 8
+
+# 限制上下文、固定种子、自定义停止后缀
+cllm_inference --model models/xxx.gguf --prompt "你好" --ctx 4096 --seed 1 --stop $'\n\n'
 ```
 
 ### 3. HTTP 服务（OpenAI 兼容）
@@ -202,9 +207,12 @@ curl http://127.0.0.1:8080/v1/completions \
 | `--prompt <text>` | 本地生成 prompt（提供则走 CLI，否则启动 HTTP） | 空 |
 | `--port <n>` | HTTP 服务端口 | 8080 |
 | `--threads <n>` | CPU 线程数 | 硬件并发数 |
+| `--ctx <n>` | 上下文硬帽（同时限制 KV） | 模型 `n_ctx` |
 | `--temperature <f>` | 采样温度（0 = greedy） | 0.8 |
 | `--top-p <f>` | 核采样（nucleus） | 0.9 |
 | `--top-k <n>` | Top-k 采样 | 40 |
+| `--seed <n>` | 采样 RNG 种子 | 随机 |
+| `--stop <str>` | 生成文本后缀停止（可重复） | 无 |
 | `--max-tokens <n>` | 最大生成 token 数 | 64 |
 
 ---
@@ -217,7 +225,7 @@ curl http://127.0.0.1:8080/v1/completions \
 | GET | `/v1/model/info` | 当前加载模型的元信息（架构、层数、上下文、模板格式） |
 | GET | `/v1/models` | OpenAI 兼容的模型列表（当前模型包装为 data 数组） |
 | POST | `/v1/completions` | 文本补全（`prompt` + 采样，支持 `stream`；返回 `usage`） |
-| POST | `/v1/chat/completions` | 对话补全（原生多轮 `messages`；返回 `usage`；流式在 `[DONE]` 前带 usage） |
+| POST | `/v1/chat/completions` | 对话补全（原生多轮 `messages`；`stop` / `seed`；返回 `usage`；流式在 `[DONE]` 前带 usage） |
 | OPTIONS | `/*` | CORS 预检，允许所有源 |
 | GET | `/` 、`/web/*`、`/models.json` | 托管运行目录下 `web/` 前端静态资源（若存在） |
 
@@ -231,11 +239,12 @@ curl http://127.0.0.1:8080/v1/completions \
 | `unsupported ggml type` | 模型含未实现的量化类型 | 已支持 13 种常用类型；如遇新类型需扩展 `quant.cpp` |
 | `in_dim not divisible by block size` | 张量内维与量化 block 不整除 | 该类模型罕见，通常是转换异常 |
 | 输出乱码 | 未走对话模板，或旧版按字节刷半截 UTF-8 | 确认 `tokenizer.chat_template`；当前流式会拼完整码点再输出 |
-| `context length exceeded` | prompt 或生成超过模型 `n_ctx` | 缩短历史 / 换更大上下文的 GGUF |
+| `context length exceeded` | prompt 或生成超过硬帽（`--ctx` 或模型 `n_ctx`） | 缩短历史 / 增大 `--ctx` |
 | 413 Payload Too Large | 请求体超过 4MB | 减小 `messages` / `prompt` |
-| 内存占用 | 量化权重按需反量化；KV 按 `n_ctx` 预留 | 0.5B Q4_K_M 权重约 430MB；`n_ctx` 很大时 KV reserve 会占数 GB |
+| 内存占用 | 量化权重按需反量化；KV 最多按 4096 token 预留 | 0.5B Q4_K_M 权重约 430MB；用 `--ctx` 限制硬帽 |
 
-> 吞吐说明：Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 **激活量化 + 整数点积**。Apple Silicon 用 NEON SDOT；x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 另有 AVX2。
+> 吞吐说明：Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 **激活量化 + 整数点积**。Apple Silicon 用 NEON SDOT；x86_64 上上述六类均有 AVX2。
+> 大核数 / 多路机器建议进程外绑核：`taskset -c 0-15 ./cllm_inference ...` 或 `numactl --interleave=all`。AVX-VNNI 尚未单独实现，有对应 CPU 时下一刀再加。
 > 相对「按行反量化 + float matmul」约 3-7x（见下文）。Q4_1/Q5_1/Q8_1/Q2_K/Q3_K 仍走 fallback。
 
 ---
@@ -331,7 +340,7 @@ make bench
 | 64 tok | 13939 ms | 14509 ms | **2222 ms** | 220 ms | **38.1 ms** | 6.27x / 5.78x |
 | 128 tok | 28268 ms | 29628 ms | **4964 ms** | 231 ms | **45.9 ms** | 5.70x / 5.03x |
 
-`model_bench` 仍按 token 逐步 `forward`，用来对比三种 `WeightMode`。端到端 CLI 走 `prefill()` 批量路径，同模型上 prefill 约 **75 tok/s**、decode 约 **27 tok/s**（35+24 token，temperature=0）。
+`model_bench` 的 prefill 段走 batched `prefill()`，decode 仍逐步 `forward`，用来对比三种 `WeightMode`。端到端 CLI 同模型上曾测 prefill 约 **75 tok/s**、decode 约 **27 tok/s**（35+24 token，temperature=0）。
 
 用法：
 
