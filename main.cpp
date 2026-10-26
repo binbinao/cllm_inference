@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -87,21 +88,40 @@ int main(int argc, char** argv) {
                 ids = tokenizer.encode(prompt, model.add_bos_token);
             }
             std::mt19937 rng(std::random_device{}());
-            engine.reset_kv_cache();
 
-            // 先 forward 整个 prompt
-            std::vector<float> logits;
-            for (int id : ids) logits = engine.forward(id);
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            std::vector<float> logits = engine.prefill(ids);
+            const auto t1 = clock::now();
 
+            cllm::Utf8StreamDecoder dec;
             std::cout << "\n" << prompt;
+            int n_gen = 0;
             for (int i = 0; i < max_tokens; ++i) {
                 int next = cllm::Sampler::sample(logits, sp, rng);
-                if (next == tokenizer.eos_id()) break;
+                if (tokenizer.is_eos(next)) break;
                 ids.push_back(next);
-                std::cout << tokenizer.decode(next) << std::flush;
+                ++n_gen;
+                std::cout << dec.feed(tokenizer.decode(next)) << std::flush;
                 logits = engine.forward(next);
             }
-            std::cout << "\n";
+            std::cout << dec.flush() << "\n";
+            const auto t2 = clock::now();
+
+            auto ms = [](clock::time_point a, clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const double prefill_ms = ms(t0, t1);
+            const double decode_ms = ms(t1, t2);
+            const int n_prompt = (int)ids.size() - n_gen;
+            if (prefill_ms > 0 && n_prompt > 0) {
+                std::cout << "prefill: " << n_prompt << " tok, "
+                          << (n_prompt / (prefill_ms / 1000.0)) << " tok/s\n";
+            }
+            if (decode_ms > 0 && n_gen > 0) {
+                std::cout << "decode: " << n_gen << " tok, "
+                          << (n_gen / (decode_ms / 1000.0)) << " tok/s\n";
+            }
         } else {
             // HTTP 服务
             std::cout << "Starting HTTP server on port " << port << " ...\n";

@@ -1,6 +1,7 @@
 #include "cllm/server/http_server.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -173,15 +174,25 @@ std::string read_line(int fd) {
     return line;
 }
 
-// 发送全部数据
+constexpr int kMaxBodyBytes = 4 * 1024 * 1024;
+
+// 发送全部数据；MSG_NOSIGNAL 避免客户端断开时 SIGPIPE 杀进程
 bool send_all(int fd, const std::string& data) {
     size_t off = 0;
     while (off < data.size()) {
-        ssize_t n = write(fd, data.data() + off, data.size() - off);
+        ssize_t n = send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
         if (n <= 0) return false;
         off += n;
     }
     return true;
+}
+
+std::string header_name_lower(const std::string& line) {
+    size_t colon = line.find(':');
+    if (colon == std::string::npos) return {};
+    std::string key = line.substr(0, colon);
+    for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return key;
 }
 
 }  // namespace
@@ -195,12 +206,10 @@ struct HttpServer::Impl {
     int listen_fd = -1;
     std::atomic<bool> running{false};
     std::mutex engine_mtx;   // 保护引擎推理（KV Cache 共享状态）
-    std::vector<std::thread> threads;
 
     ~Impl() {
         running = false;
         if (listen_fd >= 0) { shutdown(listen_fd, SHUT_RDWR); close(listen_fd); }
-        for (auto& t : threads) if (t.joinable()) t.join();
     }
 
     // 处理单个连接
@@ -217,9 +226,19 @@ struct HttpServer::Impl {
         int content_length = 0;
         std::string line;
         while (!(line = read_line(client_fd)).empty()) {
-            if (line.rfind("Content-Length:", 0) == 0) {
-                content_length = std::atoi(line.c_str() + 15);
+            if (header_name_lower(line) == "content-length") {
+                size_t colon = line.find(':');
+                content_length = std::atoi(line.c_str() + colon + 1);
             }
+        }
+
+        if (content_length > kMaxBodyBytes) {
+            std::string resp =
+                std::string("HTTP/1.1 413 Payload Too Large\r\n") + CORS_HEADERS +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(client_fd, resp);
+            close(client_fd);
+            return;
         }
 
         // 读取 body
@@ -365,10 +384,19 @@ struct HttpServer::Impl {
         return ci;
     }
 
+    void send_error(int client_fd, int code, const std::string& msg) {
+        std::string status = (code == 400) ? "400 Bad Request" : "500 Internal Server Error";
+        std::string body_s = "{\"error\":\"" + json_escape(msg) + "\"}";
+        std::string resp =
+            "HTTP/1.1 " + status + "\r\nContent-Type: application/json\r\n" + CORS_HEADERS +
+            "Content-Length: " + std::to_string(body_s.size()) +
+            "\r\nConnection: close\r\n\r\n" + body_s;
+        send_all(client_fd, resp);
+    }
+
     void handle_generate(int client_fd, const std::string& body, const std::string& path) {
         ChatInput ci = extract_chat(body, path);
 
-        // 解析采样参数
         SampleParams sp;
         double d;
         if (json_get_number(body, "temperature", d)) sp.temperature = (float)d;
@@ -379,80 +407,99 @@ struct HttpServer::Impl {
         bool stream = false;
         json_get_bool(body, "stream", stream);
 
-        // 生成（加锁保护引擎）。
-        // chat 模式下，若有多轮历史，拼接为 "user: xxx\nassistant: yyy\n..." 后交给模板，
-        // 以尽可能保留上下文（真正的多轮模板渲染需要 Jinja，当前为近似实现）。
-        std::string user_prompt = ci.user;
-        if (path == "/v1/chat/completions" && ci.history.size() > 1) {
-            std::string hist;
-            for (size_t i = 0; i + 1 < ci.history.size(); ++i) {
-                const auto& m = ci.history[i];
-                if (m.first == "system") continue;
-                hist += m.first + ": " + m.second + "\n";
-            }
-            if (!hist.empty()) user_prompt = hist + "user: " + ci.user;
-        }
         std::vector<int> ids;
-        if (tokenizer->has_chat_template()) {
-            ids = tokenizer->apply_chat_template(user_prompt, ci.system);
+        if (path == "/v1/chat/completions" && !ci.history.empty() && tokenizer->has_chat_template()) {
+            std::vector<ChatMessage> msgs;
+            msgs.reserve(ci.history.size());
+            for (const auto& m : ci.history) msgs.push_back({m.first, m.second});
+            ids = tokenizer->apply_chat_template(msgs);
+        } else if (tokenizer->has_chat_template()) {
+            ids = tokenizer->apply_chat_template(ci.user, ci.system);
         } else {
-            ids = tokenizer->encode(user_prompt, tokenizer->add_bos_token());
+            ids = tokenizer->encode(ci.user, tokenizer->add_bos_token());
+        }
+        if (ids.empty()) {
+            send_error(client_fd, 400, "empty prompt");
+            return;
         }
 
+        const int prompt_tokens = (int)ids.size();
         std::lock_guard<std::mutex> lock(engine_mtx);
-        engine->reset_kv_cache();
         std::mt19937 rng(std::random_device{}());
 
-        // 先 forward 整个 prompt
         std::vector<float> logits;
-        for (int id : ids) logits = engine->forward(id);
+        try {
+            logits = engine->prefill(ids);
+        } catch (const std::exception& e) {
+            send_error(client_fd, 400, e.what());
+            return;
+        }
+
+        auto usage_json = [&](int completion_tokens) {
+            return std::string("\"usage\":{\"prompt_tokens\":") +
+                   std::to_string(prompt_tokens) + ",\"completion_tokens\":" +
+                   std::to_string(completion_tokens) + ",\"total_tokens\":" +
+                   std::to_string(prompt_tokens + completion_tokens) + "}";
+        };
 
         if (stream) {
-            // SSE 流式响应
             std::string head =
                 std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n") +
                 CORS_HEADERS +
                 "Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
-            send_all(client_fd, head);
+            if (!send_all(client_fd, head)) return;
 
+            Utf8StreamDecoder dec;
+            int n_gen = 0;
             for (int i = 0; i < max_tokens; ++i) {
                 int next = Sampler::sample(logits, sp, rng);
-                if (next == tokenizer->eos_id()) break;
+                if (tokenizer->is_eos(next)) break;
                 ids.push_back(next);
-
-                std::string piece = tokenizer->decode(next);
+                ++n_gen;
+                std::string piece = dec.feed(tokenizer->decode(next));
+                if (!piece.empty()) {
+                    std::string data =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"" +
+                        json_escape(piece) + "\"}}]}\n\n";
+                    if (!send_all(client_fd, data)) return;
+                }
+                logits = engine->forward(next);
+            }
+            std::string tail = dec.flush();
+            if (!tail.empty()) {
                 std::string data =
                     "data: {\"choices\":[{\"delta\":{\"content\":\"" +
-                    json_escape(piece) + "\"}}]}\n\n";
-                send_all(client_fd, data);
-
-                logits = engine->forward(next);
+                    json_escape(tail) + "\"}}]}\n\n";
+                if (!send_all(client_fd, data)) return;
             }
+            send_all(client_fd, "data: {" + usage_json(n_gen) + "}\n\n");
             send_all(client_fd, "data: [DONE]\n\n");
         } else {
-            // 非流式：一次性生成并返回 JSON
+            Utf8StreamDecoder dec;
             std::string full_text;
+            int n_gen = 0;
             for (int i = 0; i < max_tokens; ++i) {
                 int next = Sampler::sample(logits, sp, rng);
-                if (next == tokenizer->eos_id()) break;
+                if (tokenizer->is_eos(next)) break;
                 ids.push_back(next);
-                full_text += tokenizer->decode(next);
+                ++n_gen;
+                full_text += dec.feed(tokenizer->decode(next));
                 logits = engine->forward(next);
             }
+            full_text += dec.flush();
 
-            // chat 模式下返回 OpenAI chat.completion 结构，便于前端复用
             std::string content;
             if (path == "/v1/chat/completions") {
                 content =
                     "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\","
                     "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\","
                     "\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(full_text) +
-                    "\"}}]}";
+                    "\"}}]," + usage_json(n_gen) + "}";
             } else {
                 content =
                     "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
                     "\"choices\":[{\"text\":\"" + json_escape(full_text) +
-                    "\",\"index\":0,\"finish_reason\":\"stop\"}]}";
+                    "\",\"index\":0,\"finish_reason\":\"stop\"}]," + usage_json(n_gen) + "}";
             }
             std::string resp =
                 std::string("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n") + CORS_HEADERS +
@@ -512,7 +559,7 @@ void HttpServer::start() {
             if (!impl_->running) break;
             continue;
         }
-        impl_->threads.emplace_back([this, cfd] { impl_->handle_connection(cfd); });
+        std::thread([this, cfd] { impl_->handle_connection(cfd); }).detach();
     }
 }
 
