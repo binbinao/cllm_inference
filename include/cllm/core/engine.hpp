@@ -36,11 +36,17 @@ public:
     TransformerEngine(TransformerEngine&&) noexcept;
     TransformerEngine& operator=(TransformerEngine&&) noexcept;
 
-    // 单步前向：输入一个 token，输出 vocab 维 logits，并更新 KV Cache
-    std::vector<float> forward(int token);
+    // 单步前向。compute_logits=false 时只更新 KV，返回空向量（prefill 中间 token）。
+    std::vector<float> forward(int token, bool compute_logits = true);
 
-    // 重置 KV Cache（开始新序列）
+    // 带前缀复用的 prefill：与已缓存 tokens 对齐 LCP，只计算后缀。
+    // 仅最后一枚 token 计算 logits。空输入或超出 n_ctx 抛异常。
+    std::vector<float> prefill(const std::vector<int>& tokens);
+
+    // 重置 KV Cache 与前缀记录（开始新序列）
     void reset_kv_cache();
+
+    int seq_len() const;
 
     const ModelConfig& config() const;
 
