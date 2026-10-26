@@ -11,16 +11,17 @@
 - **完整 GGUF 解析**：支持 GGUF v2/v3，mmap 零拷贝加载
 - **量化类型全覆盖**：支持 F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K 共 13 种 GGML 量化格式
 - **零拷贝量化推理**：量化权重直接引用 mmap 数据，按输出行惰性反量化，无需加载期全量展开为 float32（0.5B Q4_K_M 常驻内存 ~430MB）
-- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 六种权重走 vec_dot 快路径；Apple Silicon 用 ARMv8.2 SDOT NEON，x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 走 AVX2；相对 "反量化 + float matmul" 提速 **3-7x**
-- **Prefix Cache + batched prefill**：多轮对话复用公共前缀 KV；新后缀按权重静止批量矩阵乘，仅最后一枚 token 计算输出层
-- **上下文硬限制**：`seq_len` 达到模型 `n_ctx` 时明确报错，KV 按上下文长度预留，避免扩容拷贝
+- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 vec_dot；Apple Silicon 用 ARMv8.2 SDOT NEON，x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 走 AVX2；相对「反量化 + float matmul」**3-7x**
+- **Prefix Cache + batched prefill**：多轮复用公共前缀 KV；新后缀按权重静止批量矩阵乘，仅最后一枚 token 算输出层
+- **上下文硬限制**：超过模型 `n_ctx` 明确报错；KV 按上下文长度预留，避免 GB 级扩容拷贝
 - **通用 Transformer 内核**：RMSNorm、NEOX RoPE、GQA Attention、SwiGLU FFN、KV Cache
 - **CPU 多线程**：手写线程池，按行/分块并行矩阵乘
-- **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
-- **多格式对话模板**：自动识别 ChatML（Qwen）/ Llama 3 / Llama 2·Mistral 并应用对应模板
-- **双入口**：本地 CLI 推理 + OpenAI 兼容 HTTP 服务（含 SSE 流式）
-- **内置 Web UI**：单文件 HTML 对话前端，支持流式输出、模型库浏览与启动命令生成（Qwen/Llama ≤30B）
-- **自带测试与基准**：13 种量化反量化 + 矩阵乘内核 + 线程池 + 采样器共 140 项断言，含量化吞吐基准与模型级「量化 vs 反量化 fp32/fp16」三模式对比基准
+- **分词与采样**：BPE + SentencePiece，词表哈希 O(1) 查找；temperature / top-p / top-k
+- **多轮对话模板**：ChatML / Llama 3 / Llama 2·Mistral 按 `messages` 角色边界渲染，不再拼接纯文本
+- **多停止符 + UTF-8 流式**：`eos` / `<|im_end|>` / `<|eot_id|>` / `<|end_of_text|>` 均可停；流式凑齐完整码点再输出
+- **双入口**：CLI（结束打印 prefill/decode tok/s）+ OpenAI 兼容 HTTP（SSE、`usage`、断连即停、包体 4MB 上限）
+- **内置 Web UI**：单文件前端，流式对话、模型库、启动命令（Qwen/Llama ≤30B）
+- **测试与基准**：量化 / 线程池 / 采样器 / 分词器 / Prefix Cache，含量化吞吐与模型级三模式对比基准
 
 ---
 
@@ -41,7 +42,7 @@
                         ┌───────▼────────────────────────▼──────────┐
                         │            TransformerEngine               │
                         │  RMSNorm · RoPE · GQA Attention · SwiGLU   │
-                        │              KV Cache（自回归）             │
+                        │   KV Cache · Prefix Cache · batched prefill │
                         └───┬───────────────┬──────────────┬────────┘
                             │ 反量化权重     │ 并行矩阵乘    │ logits
                      ┌──────▼─────┐   ┌─────▼──────┐  ┌────▼─────┐
@@ -53,14 +54,14 @@
 | 模块 | 职责 | 关键文件 |
 |------|------|---------|
 | `GgufLoader` | 解析 GGUF 元数据/词表/张量，mmap 零拷贝加载 | `src/core/gguf.cpp` |
-| `Quant` | GGML 量化权重反量化为 float32 + 六种类型（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K）整数点积内核 | `src/core/quant.cpp` |
-| `TransformerEngine` | 单步前向：RMSNorm + NEOX RoPE + GQA Attention + SwiGLU FFN，更新 KV Cache | `src/core/engine.cpp` |
-| `Tokenizer` | BPE（gpt2 类）/ SentencePiece 双模式编解码 + Qwen chat template | `src/core/tokenizer.cpp` |
-| `Sampler` | temperature / top-k / top-p 采样，从 logits 采样下一个 token | `src/core/sampler.cpp` |
+| `Quant` | 反量化 + vec_dot（NEON / AVX2 / 标量）+ `matmul_quant_batch` | `src/core/quant.cpp` |
+| `TransformerEngine` | `prefill`（LCP 复用 + 批量后缀）/ `forward`；RMSNorm · RoPE · GQA · SwiGLU · KV | `src/core/engine.cpp` |
+| `Tokenizer` | BPE / SentencePiece、哈希词表、多轮模板、多 EOS、`Utf8StreamDecoder` | `src/core/tokenizer.cpp` |
+| `Sampler` | temperature / top-k / top-p 采样 | `src/core/sampler.cpp` |
 | `ThreadPool` | 手写线程池，按行/分块并行矩阵乘 | `src/core/thread_pool.cpp` |
-| `HttpServer` | 纯标准库实现的 OpenAI 兼容 HTTP 服务（含 SSE 流式） | `src/server/http_server.cpp` |
+| `HttpServer` | OpenAI 兼容 HTTP、SSE、`usage`、断连即停 | `src/server/http_server.cpp` |
 
-> 推理采用自回归流程：`main.cpp` 先 forward 整个 prompt，随后循环「采样 → decode → forward 下一个 token」直至 EOS 或达到 `max_tokens`。CLI 与 HTTP 两种入口复用同一套 `Tokenizer` 与 `TransformerEngine`。
+> 推理流程：`prefill(ids)` 对齐已缓存前缀并批量计算新后缀（只对最后一枚 token 求 logits），再循环「采样 → UTF-8 增量解码 → `forward` 下一枚」直至 `is_eos` 或 `max_tokens`。CLI 与 HTTP 复用同一套引擎；HTTP 单引擎串行，Prefix Cache 服务「上一串 tokens」。
 
 ---
 
@@ -108,6 +109,9 @@ sudo cmake --install build
 
 # 可选：自定义前缀
 cmake --install build --prefix $HOME/.local
+
+# 可选：关闭 -march=native（便于可移植 CI）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLLM_NATIVE=OFF
 ```
 
 安装后，可执行文件位于 `<prefix>/bin/cllm_inference`，头文件位于 `<prefix>/include/cllm/`。
@@ -166,12 +170,18 @@ curl http://127.0.0.1:8080/v1/completions \
   -d '{"prompt":"你好","temperature":0,"max_tokens":30}'
 ```
 
-**对话补全**
+**对话补全（原生多轮模板，响应含 `usage`）**
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"写一首关于春天的短诗"}],"temperature":0.8}'
+  -d '{"messages":[
+        {"role":"system","content":"用中文简短回答"},
+        {"role":"user","content":"1+1等于几？"},
+        {"role":"assistant","content":"2"},
+        {"role":"user","content":"再加 1 呢？"}
+      ],"temperature":0,"max_tokens":40}'
+# 同一进程连续请求会复用公共前缀的 KV Cache
 ```
 
 **流式响应（SSE）**
@@ -206,8 +216,8 @@ curl http://127.0.0.1:8080/v1/completions \
 | GET | `/health` | 健康检查 |
 | GET | `/v1/model/info` | 当前加载模型的元信息（架构、层数、上下文、模板格式） |
 | GET | `/v1/models` | OpenAI 兼容的模型列表（当前模型包装为 data 数组） |
-| POST | `/v1/completions` | 文本补全（`prompt` + 采样参数，支持 `stream`；非流式含 `usage`） |
-| POST | `/v1/chat/completions` | 对话补全（原生多轮 `messages` 模板；非流式含 `usage`） |
+| POST | `/v1/completions` | 文本补全（`prompt` + 采样，支持 `stream`；返回 `usage`） |
+| POST | `/v1/chat/completions` | 对话补全（原生多轮 `messages`；返回 `usage`；流式在 `[DONE]` 前带 usage） |
 | OPTIONS | `/*` | CORS 预检，允许所有源 |
 | GET | `/` 、`/web/*`、`/models.json` | 托管运行目录下 `web/` 前端静态资源（若存在） |
 
@@ -220,26 +230,28 @@ curl http://127.0.0.1:8080/v1/completions \
 | `missing tensor: blk.N.xxx` | 模型张量命名与当前支持架构不匹配 | 换用 qwen2/llama 架构的 GGUF |
 | `unsupported ggml type` | 模型含未实现的量化类型 | 已支持 13 种常用类型；如遇新类型需扩展 `quant.cpp` |
 | `in_dim not divisible by block size` | 张量内维与量化 block 不整除 | 该类模型罕见，通常是转换异常 |
-| 输出乱码 | 模型为 chat 模型但未走对话模板 | 确认模型含 `tokenizer.chat_template`；支持 ChatML / Llama3 / Llama2 |
-| 内存占用 | 量化权重按需反量化 | 0.5B Q4_K_M 约 430MB（相比全量反量化缓存的 ~3GB 大幅下降）|
+| 输出乱码 | 未走对话模板，或旧版按字节刷半截 UTF-8 | 确认 `tokenizer.chat_template`；当前流式会拼完整码点再输出 |
+| `context length exceeded` | prompt 或生成超过模型 `n_ctx` | 缩短历史 / 换更大上下文的 GGUF |
+| 413 Payload Too Large | 请求体超过 4MB | 减小 `messages` / `prompt` |
+| 内存占用 | 量化权重按需反量化；KV 按 `n_ctx` 预留 | 0.5B Q4_K_M 权重约 430MB；`n_ctx` 很大时 KV reserve 会占数 GB |
 
-> 吞吐说明：Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 已启用**激活量化 + 整数点积 vec_dot 快路径**，在 Apple Silicon 上跟进 NEON SDOT 指令，
-> 相对旧的 “按行反量化 + float matmul”有 3-7x 吞吐提升（见下文「性能基准」）。其余量化类型（Q4_1/Q5_1/Q8_1/Q2_K/Q3_K）划入 fallback 路径，行为不变。
+> 吞吐说明：Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 走 **激活量化 + 整数点积**。Apple Silicon 用 NEON SDOT；x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 另有 AVX2。
+> 相对「按行反量化 + float matmul」约 3-7x（见下文）。Q4_1/Q5_1/Q8_1/Q2_K/Q3_K 仍走 fallback。
 
 ---
 
 ## 测试与基准
 
 ```bash
-# 运行全部单元测试（量化 / 线程池 / 采样器）
+# 运行全部单元测试（量化 / 线程池 / 采样器 / 分词器 / Prefix Cache）
 make test
 
 # 追加运行量化矩阵乘吞吐基准
 make bench
 ```
 
-- **覆盖范围**：13 种 GGML 量化类型反量化、`matmul_quant` 内核（Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 均对比 float 参考路径）、
-  线程池并行一致性、采样器 greedy/top-k/top-p/温度行为，共 **140+ 项断言**。
+- **覆盖范围**：13 种 GGML 反量化、`matmul_quant` / `matmul_quant_batch`、线程池、采样器、
+  多轮模板 / 多 EOS / UTF-8 流式、Prefix Cache / `n_ctx` / skip-logits（模型文件缺失时 engine 用例 skip）。
 - **基准**：`tests/bench.cpp` 报告各量化类型的 GFLOP/s 及相对纯 float matmul 的比值；
   `tests/model_bench.cpp` 对真实模型做「量化 vs 反量化 fp32/fp16」的 prefill/decode 对比（见下文）。
 - CMake 构建下：`cmake --build build && ctest --test-dir build`。
@@ -310,20 +322,22 @@ make bench
 - ⚠️ **文件名可能与实际量化不符**：`qwen2.5-0.5b-instruct-q4_k_m.gguf` 的实际主体是 **Q5_0（61.6%）**，
   并非文件名标注的 Q4_K_M。`model_bench` 会打印每个模型的真实量化类型分布（按参数量加权），便于识别。
 
-补充实测（Linux x86_64，8 核，`-O3 -march=native`，Qwen3-0.6B-Q8_0，模型级三模式对比）：
+补充实测（Linux x86_64，8 核，`-O3 -march=native` + AVX2，Qwen3-0.6B-Q8_0）：
 
-| 指标 | fp32 反量化 | fp16 反量化 | 量化 (Quant, 默认) |
-|------|-----------|-----------|-------------------|
-| prefill 128 token (ms) | 27894.6 | 33684.0 | **4854.1** |
-| decode 128 token (ms) | 227.5 | 278.3 | **43.6** |
+| 输入 | fp32 prefill | fp16 prefill | **quant prefill** | fp32 decode | **quant decode** | quant 加速（prefill / decode） |
+|------|--------------|--------------|-------------------|-------------|------------------|--------------------------------|
+| 16 tok | 3443 ms | 3716 ms | **520 ms** | 215 ms | **33.4 ms** | 6.63x / 6.43x |
+| 32 tok | 6947 ms | 7117 ms | **1056 ms** | 215 ms | **35.1 ms** | 6.58x / 6.11x |
+| 64 tok | 13939 ms | 14509 ms | **2222 ms** | 220 ms | **38.1 ms** | 6.27x / 5.78x |
+| 128 tok | 28268 ms | 29628 ms | **4964 ms** | 231 ms | **45.9 ms** | 5.70x / 5.03x |
 
-量化默认路径相对反量化方法 prefill 快约 **6x**、decode 快约 **5~6.7x**，且 fp16 反量化略慢于 fp32（约 0.83x）。
+`model_bench` 仍按 token 逐步 `forward`，用来对比三种 `WeightMode`。端到端 CLI 走 `prefill()` 批量路径，同模型上 prefill 约 **75 tok/s**、decode 约 **27 tok/s**（35+24 token，temperature=0）。
 
 用法：
 
 ```bash
 # 对指定模型对比（或直接运行，默认测 models/ 下三个模型）
-clang++ -std=c++20 -O2 -Iinclude tests/model_bench.cpp \
+clang++ -std=c++20 -O3 -march=native -Iinclude tests/model_bench.cpp \
   src/core/engine.cpp src/core/gguf.cpp src/core/quant.cpp src/core/sampler.cpp \
   src/core/thread_pool.cpp src/core/tokenizer.cpp -o /tmp/model_bench -pthread
 /tmp/model_bench models/Qwen3-0.6B-Q8_0.gguf
@@ -343,8 +357,8 @@ clang++ -std=c++20 -O2 -Iinclude tests/model_bench.cpp \
 
 ### 功能
 
-- **多轮对话**：对话历史在前端维护，每次请求完整传回后端
-- **SSE 流式输出**：字符逐 token 流式显示，支持中途中止
+- **多轮对话**：历史在前端维护，完整 `messages` 回传；后端按角色套原生模板，并复用公共前缀 KV
+- **SSE 流式输出**：按完整 UTF-8 码点显示；前端中止后后端立即停算并释放引擎锁
 - **当前模型展示**：从 `/v1/model/info` 读取架构、层数、上下文、模板格式
 - **模型库**：内置 Qwen 2.5 / Qwen 3 / Llama 3.1 / Llama 3.2 的 GGUF 清单（均 ≤30B）
   —— 点击模型弹出**下载 + 启动命令**。
