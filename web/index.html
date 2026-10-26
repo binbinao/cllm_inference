@@ -563,12 +563,137 @@
     background: var(--bg-elev);
     border: 1px solid var(--border);
     border-radius: 16px;
-    padding: 10px 10px 10px 16px;
+    padding: 10px 10px 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    box-shadow: var(--shadow-md);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .composer-row {
     display: flex;
     gap: 8px;
     align-items: flex-end;
-    box-shadow: var(--shadow-md);
-    transition: border-color .15s, box-shadow .15s;
+  }
+  .attach-preview {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 2px 4px 4px;
+  }
+  .attach-preview[hidden] { display: none; }
+  .attach-chip {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--bg-input);
+  }
+  .attach-chip img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .attach-chip button {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0,0,0,.55);
+    color: #fff;
+    font-size: 12px;
+    line-height: 18px;
+    padding: 0;
+  }
+  .attach-btn {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 10px;
+  }
+  .attach-btn:hover {
+    background: var(--bg-hover);
+    color: var(--fg);
+  }
+  .attach-btn svg { width: 18px; height: 18px; }
+  .msg-img {
+    display: block;
+    max-width: 280px;
+    max-height: 220px;
+    border-radius: 10px;
+    margin: 8px 0 0;
+    object-fit: cover;
+    border: 1px solid var(--border-soft);
+  }
+  .msg.user .msg-img { margin-top: 8px; }
+  .tool-card {
+    margin: 10px 0;
+    padding: 10px 12px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 13px;
+  }
+  .tool-card .tool-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+  }
+  .tool-card pre {
+    margin: 8px 0 0;
+    padding: 8px 10px;
+    background: var(--code-bg);
+    border-radius: 8px;
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tool-card .tool-result {
+    margin-top: 8px;
+    color: var(--fg-soft);
+  }
+  .tools-panel {
+    max-width: 760px;
+    margin: 8px auto 0;
+  }
+  .tools-panel[hidden] { display: none; }
+  .tools-panel textarea {
+    width: 100%;
+    min-height: 110px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .tools-panel textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .tools-hint {
+    margin: 6px 2px 0;
+    font-size: 11px;
+    color: var(--fg-muted);
   }
   .composer:focus-within {
     border-color: var(--accent);
@@ -818,7 +943,7 @@
         <!-- 首屏 -->
         <div class="welcome" id="welcome">
           <h2>你好，开始对话吧</h2>
-          <p>本地推理，隐私优先。流式响应，支持 Markdown 与代码高亮。</p>
+          <p>本地推理，隐私优先。支持 Markdown、图片附件与工具调用。</p>
           <div class="suggestions" id="suggestions">
             <!-- 由 JS 填充 -->
           </div>
@@ -828,20 +953,36 @@
 
     <div class="composer-wrap">
       <form class="composer" id="composer" onsubmit="return false;">
-        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" autofocus></textarea>
-        <button type="submit" class="send-btn" id="btn-send" title="发送">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="12" y1="19" x2="12" y2="5"/>
-            <polyline points="5 12 12 5 19 12"/>
-          </svg>
-        </button>
+        <div class="attach-preview" id="attach-preview" hidden></div>
+        <div class="composer-row">
+          <button type="button" class="attach-btn" id="btn-attach" title="添加图片">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
+          </button>
+          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" autofocus></textarea>
+          <button type="submit" class="send-btn" id="btn-send" title="发送">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"/>
+              <polyline points="5 12 12 5 19 12"/>
+            </svg>
+          </button>
+        </div>
+        <input type="file" id="file-images" accept="image/*" multiple hidden>
       </form>
+      <div class="tools-panel" id="tools-panel" hidden>
+        <textarea id="tools-json" spellcheck="false"></textarea>
+        <p class="tools-hint">模型按 OpenAI tools 格式调用。前端可本地执行 get_current_time 与 calculator；其它工具会展示调用内容。</p>
+      </div>
       <div class="params-bar">
         <label>温度 <input type="number" id="p-temp" min="0" max="2" step="0.1" value="0.7"></label>
         <label>top-p <input type="number" id="p-topp" min="0" max="1" step="0.05" value="0.9"></label>
         <label>top-k <input type="number" id="p-topk" min="0" max="200" step="1" value="40"></label>
         <label>max tokens <input type="number" id="p-max" min="1" max="4096" step="16" value="512"></label>
-        <label class="toggle" style="margin-left:auto;"><input type="checkbox" id="p-stream" checked> 流式</label>
+        <label class="toggle" style="margin-left:auto;"><input type="checkbox" id="p-tools"> 工具调用</label>
+        <label class="toggle"><input type="checkbox" id="p-stream" checked> 流式</label>
       </div>
     </div>
   </main>
@@ -897,6 +1038,32 @@ let allModels = [];
 let currentFilter = "all";
 let messages = [];
 let aborter = null;
+let pendingImages = [];
+const MAX_TOOL_ROUNDS = 3;
+const DEFAULT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "获取当前本地日期与时间",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "calculator",
+      description: "计算数学表达式，例如 2+3*4 或 (1+2)^3",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: { type: "string", description: "要计算的数学表达式" }
+        },
+        required: ["expression"]
+      }
+    }
+  }
+];
 
 /* ---------- Markdown 渲染 ---------- */
 const md = (() => {
@@ -996,6 +1163,7 @@ const SUGGESTIONS = [
   { title: "解释代码", hint: "逐行讲解一段 C++", prompt: "请解释下面这段 C++ 代码的作用：\n\n```cpp\nstd::vector<int> ids;\nfor (size_t i = 0; i + 1 < ids.size(); ++i) {\n    // ...\n}\n```" },
   { title: "翻译一段话", hint: "英 → 中，保持语气", prompt: "请把下面这段英文翻译成自然的中文：\n\n\"Attention is all you need\" is a seminal paper that introduced the Transformer architecture." },
   { title: "头脑风暴", hint: "给出几个产品点子", prompt: "请为一款面向开发者的本地 LLM 工具，提出 5 个有创意的新功能点子。" },
+  { title: "现在几点", hint: "调用时间工具", prompt: "现在几点了？请用工具查询当前时间。" },
 ];
 function renderSuggestions() {
   $("suggestions").innerHTML = SUGGESTIONS.map(s => `
@@ -1121,6 +1289,184 @@ document.querySelectorAll(".modal pre button.copy").forEach(btn => {
   });
 });
 
+function userTextOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter(p => p && p.type === "text").map(p => p.text || "").join("\n");
+}
+
+function renderUserContent(container, content) {
+  container.innerHTML = "";
+  if (typeof content === "string") {
+    container.textContent = content;
+    return;
+  }
+  if (!Array.isArray(content)) {
+    container.textContent = String(content || "");
+    return;
+  }
+  for (const part of content) {
+    if (!part) continue;
+    if (part.type === "text" && part.text) {
+      const t = document.createElement("div");
+      t.textContent = part.text;
+      container.appendChild(t);
+    } else if (part.type === "image_url" && part.image_url && part.image_url.url) {
+      const img = document.createElement("img");
+      img.className = "msg-img";
+      img.src = part.image_url.url;
+      img.alt = "附件";
+      container.appendChild(img);
+    }
+  }
+}
+
+function appendToolCard(container, call, result) {
+  const card = document.createElement("div");
+  card.className = "tool-card";
+  const args = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}, null, 2);
+  card.innerHTML = `
+    <div class="tool-head">工具 · ${escapeHtml(call.name || "unknown")}</div>
+    <pre>${escapeHtml(args || "{}")}</pre>
+    <div class="tool-result">${escapeHtml(result || "")}</div>
+  `;
+  container.appendChild(card);
+}
+
+function parseToolCallsFromText(text) {
+  const calls = [];
+  const re = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  let m;
+  while ((m = re.exec(text || ""))) {
+    const inner = m[1].trim();
+    let name = "";
+    let args = {};
+    const brace = inner.indexOf("{");
+    if (brace >= 0) {
+      try {
+        const obj = JSON.parse(inner.slice(brace));
+        name = obj.name || obj.function || "";
+        args = obj.arguments || obj.parameters || {};
+        if (typeof args === "string") {
+          try { args = JSON.parse(args); } catch (_) { /* keep string */ }
+        }
+      } catch (_) { /* fall through */ }
+    }
+    if (!name) {
+      const first = inner.split("\n").map(s => s.trim()).find(Boolean) || "";
+      name = first.replace(/^name\s*[:=]\s*/i, "");
+    }
+    if (name) calls.push({ name, arguments: args });
+  }
+  return calls;
+}
+
+function normalizeToolCalls(obj, text) {
+  const raw = obj?.choices?.[0]?.message?.tool_calls
+    || obj?.choices?.[0]?.delta?.tool_calls
+    || [];
+  const fromApi = (Array.isArray(raw) ? raw : []).map(tc => {
+    const fn = tc.function || tc;
+    let args = fn.arguments || {};
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); } catch (_) { /* keep */ }
+    }
+    return { name: fn.name || "", arguments: args };
+  }).filter(c => c.name);
+  return fromApi.length ? fromApi : parseToolCallsFromText(text);
+}
+
+function runBuiltinTool(name, args) {
+  if (name === "get_current_time") {
+    return new Date().toLocaleString("zh-CN", {
+      weekday: "long", year: "numeric", month: "long", day: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit"
+    });
+  }
+  if (name === "calculator") {
+    const expr = String((args && (args.expression || args.expr)) || "").trim();
+    if (!expr) return "错误：缺少 expression";
+    if (!/^[0-9+\-*/().%\s^eE]+$/.test(expr)) return "错误：表达式包含非法字符";
+    try {
+      const val = Function('"use strict"; return (' + expr.replace(/\^/g, "**") + ")")();
+      return String(val);
+    } catch (e) {
+      return "计算失败：" + e.message;
+    }
+  }
+  return "该工具未在前端实现，无法执行。";
+}
+
+function parseToolsJson() {
+  const raw = ($("tools-json").value || "").trim();
+  if (!raw) return DEFAULT_TOOLS;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : DEFAULT_TOOLS;
+  } catch (_) {
+    return DEFAULT_TOOLS;
+  }
+}
+
+function renderAttachPreview() {
+  const box = $("attach-preview");
+  if (!pendingImages.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = pendingImages.map((im, i) => `
+    <div class="attach-chip">
+      <img src="${im.dataUrl}" alt="${escapeHtml(im.name || "图片")}">
+      <button type="button" data-i="${i}" title="移除">×</button>
+    </div>
+  `).join("");
+  box.querySelectorAll("button").forEach(btn => {
+    btn.onclick = () => {
+      pendingImages.splice(Number(btn.dataset.i), 1);
+      renderAttachPreview();
+    };
+  });
+}
+
+function loadImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const max = 1280;
+      let w = img.width, h = img.height;
+      if (Math.max(w, h) > max) {
+        const s = max / Math.max(w, h);
+        w = Math.round(w * s);
+        h = Math.round(h * s);
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      resolve({ name: file.name, dataUrl: canvas.toDataURL("image/jpeg", 0.82) });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("无法读取图片"));
+    };
+    img.src = url;
+  });
+}
+
+function buildUserContent(text, images) {
+  if (!images.length) return text;
+  const parts = [];
+  if (text) parts.push({ type: "text", text });
+  for (const im of images) {
+    parts.push({ type: "image_url", image_url: { url: im.dataUrl } });
+  }
+  return parts;
+}
+
 /* ---------- 消息渲染 ---------- */
 function addMessage(role, content = "", loading = false) {
   const welcome = $("welcome");
@@ -1129,8 +1475,8 @@ function addMessage(role, content = "", loading = false) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
 
-  const avatar = role === "user" ? "我" : "AI";
-  const roleLabel = role === "user" ? "你" : "助手";
+  const avatar = role === "user" ? "我" : (role === "tool" ? "工具" : "AI");
+  const roleLabel = role === "user" ? "你" : (role === "tool" ? "工具结果" : "助手");
 
   wrap.innerHTML = `
     <div class="msg-header">
@@ -1145,11 +1491,10 @@ function addMessage(role, content = "", loading = false) {
   `;
   const contentEl = wrap.querySelector(".msg-content");
   if (role === "user") {
-    contentEl.textContent = content;
+    renderUserContent(contentEl, content);
   } else {
-    renderMarkdown(contentEl, content);
+    renderMarkdown(contentEl, typeof content === "string" ? content : userTextOf(content));
   }
-  // 消息级操作
   wrap.querySelectorAll(".msg-actions button").forEach(btn => {
     btn.addEventListener("click", () => {
       if (btn.dataset.act === "copy") {
@@ -1170,16 +1515,16 @@ function addMessage(role, content = "", loading = false) {
 }
 
 function regenerateLast() {
-  // 移除最后一条 assistant 消息，重新生成
-  const lastAsst = chatContainer.querySelector(".msg.assistant:last-of-type");
-  if (!lastAsst) return;
-  if (messages.length && messages[messages.length - 1].role === "assistant") {
+  if (!chatContainer.querySelector(".msg.assistant")) return;
+  while (messages.length && messages[messages.length - 1].role !== "user") {
     messages.pop();
   }
-  lastAsst.remove();
+  while (true) {
+    const last = chatContainer.querySelector(".msg:last-of-type");
+    if (!last || last.classList.contains("user")) break;
+    last.remove();
+  }
   if (messages.length && messages[messages.length - 1].role === "user") {
-    const lastUserText = messages[messages.length - 1].content;
-    // 不改 messages，直接走一次生成（messages 已含 user 消息）
     doGenerate();
   }
 }
@@ -1187,20 +1532,23 @@ function regenerateLast() {
 /* ---------- 生成 ---------- */
 async function send() {
   const text = $("input").value.trim();
-  if (!text || aborter) return;
+  const images = pendingImages.slice();
+  if ((!text && !images.length) || aborter) return;
   if (!currentModel) {
     alert("后端未就绪，请先启动 cllm_inference 服务");
     return;
   }
   $("input").value = "";
   autoGrow($("input"));
-  addMessage("user", text);
-  messages.push({ role: "user", content: text });
+  pendingImages = [];
+  renderAttachPreview();
+  const content = buildUserContent(text, images);
+  addMessage("user", content);
+  messages.push({ role: "user", content });
   doGenerate();
 }
 
-async function doGenerate() {
-  const stream = $("p-stream").checked;
+async function requestCompletion(stream) {
   const body = {
     model: currentModel.id,
     messages: messages,
@@ -1210,77 +1558,100 @@ async function doGenerate() {
     max_tokens: parseInt($("p-max").value, 10),
     stream: stream
   };
+  if ($("p-tools").checked) body.tools = parseToolsJson();
 
   const { wrap, contentEl } = addMessage("assistant", "", true);
-  setGenerating(true);
-  aborter = new AbortController();
   let acc = "";
+  let lastObj = null;
 
-  try {
-    const res = await fetch(API_BASE + "/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: aborter.signal,
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+  const res = await fetch(API_BASE + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: aborter.signal,
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
 
-    if (stream) {
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      let rafScheduled = false;
-      const scheduleRender = () => {
-        if (rafScheduled) return;
-        rafScheduled = true;
-        requestAnimationFrame(() => {
-          rafScheduled = false;
-          renderMarkdown(contentEl, acc);
-          contentEl.classList.add("typing-cursor");
-          scrollToBottom();
-        });
-      };
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const chunk = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          for (const line of chunk.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (data === "[DONE]") continue;
-            try {
-              const obj = JSON.parse(data);
-              const delta = obj.choices?.[0]?.delta?.content;
-              if (delta) {
-                acc += delta;
-                scheduleRender();
-              }
-            } catch (_) { /* ignore */ }
-          }
+  if (stream) {
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let rafScheduled = false;
+    const scheduleRender = () => {
+      if (rafScheduled) return;
+      rafScheduled = true;
+      requestAnimationFrame(() => {
+        rafScheduled = false;
+        renderMarkdown(contentEl, acc);
+        contentEl.classList.add("typing-cursor");
+        scrollToBottom();
+      });
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(data);
+            lastObj = obj;
+            const delta = obj.choices?.[0]?.delta?.content;
+            if (delta) {
+              acc += delta;
+              scheduleRender();
+            }
+          } catch (_) { /* ignore */ }
         }
       }
-    } else {
-      const obj = await res.json();
-      acc = obj.choices?.[0]?.message?.content || obj.choices?.[0]?.text || "";
-      renderMarkdown(contentEl, acc);
     }
-    contentEl.classList.remove("typing-cursor");
-    wrap.dataset.raw = acc;
-    messages.push({ role: "assistant", content: acc });
+  } else {
+    lastObj = await res.json();
+    acc = lastObj.choices?.[0]?.message?.content || lastObj.choices?.[0]?.text || "";
+    renderMarkdown(contentEl, acc);
+  }
+  contentEl.classList.remove("typing-cursor");
+  wrap.dataset.raw = acc;
+  return { wrap, contentEl, acc, lastObj };
+}
+
+async function doGenerate() {
+  const stream = $("p-stream").checked;
+  setGenerating(true);
+  aborter = new AbortController();
+  try {
+    for (let round = 0; round <= MAX_TOOL_ROUNDS; ++round) {
+      const { wrap, contentEl, acc, lastObj } = await requestCompletion(stream);
+      const calls = $("p-tools").checked ? normalizeToolCalls(lastObj, acc) : [];
+      messages.push({ role: "assistant", content: acc });
+      if (!calls.length || round === MAX_TOOL_ROUNDS) break;
+      for (const call of calls) {
+        const result = runBuiltinTool(call.name, call.arguments);
+        appendToolCard(contentEl, call, result);
+        messages.push({
+          role: "tool",
+          name: call.name,
+          content: typeof result === "string" ? result : JSON.stringify(result)
+        });
+      }
+      scrollToBottom();
+    }
   } catch (e) {
-    contentEl.classList.remove("typing-cursor");
+    const last = chatContainer.querySelector(".msg.assistant:last-of-type .msg-content");
+    if (last) last.classList.remove("typing-cursor");
     if (e.name === "AbortError") {
-      renderMarkdown(contentEl, acc + "\n\n*（已停止）*");
-    } else {
-      renderMarkdown(contentEl, acc);
+      if (last) renderMarkdown(last, (last.closest(".msg").dataset.raw || "") + "\n\n*（已停止）*");
+    } else if (last) {
       const chip = document.createElement("div");
       chip.className = "error-chip";
       chip.textContent = "错误：" + e.message;
-      contentEl.appendChild(chip);
+      last.appendChild(chip);
     }
   } finally {
     aborter = null;
@@ -1310,6 +1681,8 @@ function setGenerating(on) {
 function clearChat() {
   if (aborter) { aborter.abort(); aborter = null; }
   messages = [];
+  pendingImages = [];
+  renderAttachPreview();
   chatContainer.innerHTML = "";
   // 重新插入欢迎屏
   const w = document.createElement("div");
@@ -1317,7 +1690,7 @@ function clearChat() {
   w.id = "welcome";
   w.innerHTML = `
     <h2>你好，开始对话吧</h2>
-    <p>本地推理，隐私优先。流式响应，支持 Markdown 与代码高亮。</p>
+    <p>本地推理，隐私优先。支持 Markdown、图片附件与工具调用。</p>
     <div class="suggestions" id="suggestions"></div>
   `;
   chatContainer.appendChild(w);
@@ -1350,6 +1723,35 @@ $("btn-clear").onclick = () => {
   if (chatContainer.querySelector(".msg") && !confirm("清空当前对话？")) return;
   clearChat();
 };
+$("tools-json").value = JSON.stringify(DEFAULT_TOOLS, null, 2);
+$("p-tools").addEventListener("change", () => {
+  $("tools-panel").hidden = !$("p-tools").checked;
+});
+$("btn-attach").addEventListener("click", () => $("file-images").click());
+$("file-images").addEventListener("change", async (e) => {
+  const files = Array.from(e.target.files || []);
+  e.target.value = "";
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+    try {
+      pendingImages.push(await loadImageFile(file));
+    } catch (err) {
+      alert(err.message || "图片读取失败");
+    }
+  }
+  renderAttachPreview();
+});
+$("input").addEventListener("paste", async (e) => {
+  const items = Array.from(e.clipboardData?.items || []);
+  const images = items.filter(it => it.type.startsWith("image/")).map(it => it.getAsFile()).filter(Boolean);
+  if (!images.length) return;
+  e.preventDefault();
+  for (const file of images) {
+    try { pendingImages.push(await loadImageFile(file)); }
+    catch (err) { alert(err.message || "图片读取失败"); }
+  }
+  renderAttachPreview();
+});
 
 /* ---------- 初始化 ---------- */
 fetchModelInfo();

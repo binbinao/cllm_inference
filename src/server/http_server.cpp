@@ -155,52 +155,246 @@ const char* CORS_HEADERS =
     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
 
-// 从 OpenAI chat messages 数组中解析 (role, content) 对，保留顺序。
-// 极简解析：按 "role":"..." 与 "content":"..." 顺序配对，兼容单个 messages 对象或数组。
+size_t json_skip_ws(const std::string& s, size_t i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+    return i;
+}
+
+size_t json_skip_string(const std::string& s, size_t i) {
+    if (i >= s.size() || s[i] != '"') return i;
+    ++i;
+    while (i < s.size()) {
+        if (s[i] == '\\' && i + 1 < s.size()) { i += 2; continue; }
+        if (s[i] == '"') return i + 1;
+        ++i;
+    }
+    return i;
+}
+
+size_t json_match(const std::string& s, size_t open) {
+    if (open >= s.size()) return open;
+    const char oc = s[open];
+    const char cc = (oc == '{') ? '}' : (oc == '[' ? ']' : 0);
+    if (!cc) return open;
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ) {
+        if (s[i] == '"') { i = json_skip_string(s, i); continue; }
+        if (s[i] == oc) ++depth;
+        else if (s[i] == cc && --depth == 0) return i + 1;
+        ++i;
+    }
+    return s.size();
+}
+
+bool json_read_string_at(const std::string& s, size_t quote, std::string& out, size_t& end) {
+    if (quote >= s.size() || s[quote] != '"') return false;
+    out.clear();
+    size_t i = quote + 1;
+    for (; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            const char n = s[i + 1];
+            if (n == 'n') out += '\n';
+            else if (n == 't') out += '\t';
+            else if (n == 'r') out += '\r';
+            else out += n;
+            ++i;
+        } else if (s[i] == '"') {
+            end = i + 1;
+            return true;
+        } else {
+            out += s[i];
+        }
+    }
+    return false;
+}
+
+std::string flatten_content_value(const std::string& s, size_t colon) {
+    size_t i = json_skip_ws(s, colon + 1);
+    if (i >= s.size()) return "";
+    if (s[i] == '"') {
+        std::string text;
+        size_t end = i;
+        if (json_read_string_at(s, i, text, end)) return text;
+        return "";
+    }
+    if (s[i] != '[') return "";
+    const size_t arr_end = json_match(s, i);
+    std::string text;
+    size_t cur = i + 1;
+    while (cur < arr_end) {
+        cur = json_skip_ws(s, cur);
+        if (cur >= arr_end || s[cur] == ']') break;
+        if (s[cur] == '{') {
+            const size_t obj_end = json_match(s, cur);
+            const std::string obj = s.substr(cur, obj_end - cur);
+            size_t tp = obj.find("\"type\"");
+            std::string typ;
+            if (tp != std::string::npos) {
+                size_t c = obj.find(':', tp);
+                size_t q = obj.find('"', c == std::string::npos ? 0 : c + 1);
+                size_t e = q;
+                json_read_string_at(obj, q, typ, e);
+            }
+            if (typ == "image_url" || obj.find("\"image_url\"") != std::string::npos) {
+                if (!text.empty()) text += "\n";
+                text += "[用户附带了一张图片；当前引擎按文本推理，看不到像素。]";
+            } else {
+                size_t tx = obj.find("\"text\"");
+                if (tx != std::string::npos) {
+                    size_t c = obj.find(':', tx);
+                    size_t q = (c == std::string::npos) ? std::string::npos : json_skip_ws(obj, c + 1);
+                    std::string part;
+                    size_t e = 0;
+                    if (q != std::string::npos && json_read_string_at(obj, q, part, e) && !part.empty()) {
+                        if (!text.empty()) text += "\n";
+                        text += part;
+                    }
+                }
+            }
+            cur = obj_end;
+        } else if (s[cur] == '"') {
+            std::string part;
+            if (json_read_string_at(s, cur, part, cur) && !part.empty()) {
+                if (!text.empty()) text += "\n";
+                text += part;
+            }
+        } else {
+            ++cur;
+        }
+        cur = json_skip_ws(s, cur);
+        if (cur < arr_end && s[cur] == ',') ++cur;
+    }
+    return text;
+}
+
+std::string extract_tools_prompt(const std::string& body) {
+    size_t p = body.find("\"tools\"");
+    if (p == std::string::npos) return "";
+    size_t colon = body.find(':', p + 7);
+    if (colon == std::string::npos) return "";
+    size_t arr = json_skip_ws(body, colon + 1);
+    if (arr >= body.size() || body[arr] != '[') return "";
+    size_t end = json_match(body, arr);
+    if (end <= arr + 2) return "";
+    const std::string tools = body.substr(arr, end - arr);
+    if (tools.find('{') == std::string::npos) return "";
+    return std::string(
+        "\n\n# Tools\n"
+        "你可以调用下列工具。需要调用时立刻输出，不要思考过程：\n"
+        "<tool_call>\n{\"name\":\"工具名\",\"arguments\":{...}}\n</tool_call>\n"
+        "不要编造工具结果。可用工具 JSON：\n") + tools + "\n";
+}
+
+struct ParsedToolCall {
+    std::string name;
+    std::string arguments;
+};
+
+void json_trim(std::string& s) {
+    size_t a = 0;
+    while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\n' || s[a] == '\r')) ++a;
+    size_t b = s.size();
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r')) --b;
+    s = s.substr(a, b - a);
+}
+
+std::vector<ParsedToolCall> parse_tool_calls(const std::string& text) {
+    std::vector<ParsedToolCall> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t a = text.find("<tool_call>", pos);
+        if (a == std::string::npos) break;
+        size_t b = text.find("</tool_call>", a + 11);
+        if (b == std::string::npos) break;
+        std::string inner = text.substr(a + 11, b - (a + 11));
+        json_trim(inner);
+        ParsedToolCall tc;
+        size_t brace = inner.find('{');
+        if (brace != std::string::npos) {
+            const std::string obj = inner.substr(brace);
+            size_t np = obj.find("\"name\"");
+            if (np != std::string::npos) {
+                size_t c = obj.find(':', np);
+                size_t q = (c == std::string::npos) ? std::string::npos : json_skip_ws(obj, c + 1);
+                size_t e = 0;
+                if (q != std::string::npos) json_read_string_at(obj, q, tc.name, e);
+            }
+            size_t ap = obj.find("\"arguments\"");
+            if (ap == std::string::npos) ap = obj.find("\"parameters\"");
+            if (ap != std::string::npos) {
+                size_t c = obj.find(':', ap);
+                size_t v = (c == std::string::npos) ? std::string::npos : json_skip_ws(obj, c + 1);
+                if (v != std::string::npos && v < obj.size()) {
+                    if (obj[v] == '{') {
+                        const size_t end = json_match(obj, v);
+                        tc.arguments = obj.substr(v, end - v);
+                    } else if (obj[v] == '"') {
+                        json_read_string_at(obj, v, tc.arguments, v);
+                    }
+                }
+            }
+        }
+        if (tc.name.empty()) {
+            size_t line_end = inner.find('\n');
+            tc.name = (line_end == std::string::npos) ? inner : inner.substr(0, line_end);
+            json_trim(tc.name);
+        }
+        if (tc.arguments.empty()) tc.arguments = "{}";
+        if (!tc.name.empty()) out.push_back(std::move(tc));
+        pos = b + 12;
+    }
+    return out;
+}
+
+std::string tool_calls_json(const std::vector<ParsedToolCall>& calls) {
+    std::string s = "[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        if (i) s += ",";
+        s += "{\"id\":\"call_" + std::to_string(i) + "\",\"type\":\"function\",\"function\":{\"name\":\"" +
+             json_escape(calls[i].name) + "\",\"arguments\":\"" + json_escape(calls[i].arguments) + "\"}}";
+    }
+    s += "]";
+    return s;
+}
+
+// 从 OpenAI chat messages 解析 (role, content)。content 可以是字符串或多模态数组。
 std::vector<std::pair<std::string, std::string>>
 parse_messages(const std::string& body) {
     std::vector<std::pair<std::string, std::string>> out;
     size_t p = body.find("\"messages\"");
     if (p == std::string::npos) return out;
-    size_t arr_start = body.find('[', p);
-    size_t arr_end = body.find(']', arr_start == std::string::npos ? p : arr_start);
-    if (arr_start == std::string::npos || arr_end == std::string::npos) return out;
-
-    size_t cur = arr_start;
+    size_t colon = body.find(':', p + 10);
+    if (colon == std::string::npos) return out;
+    size_t arr_start = json_skip_ws(body, colon + 1);
+    if (arr_start >= body.size() || body[arr_start] != '[') return out;
+    const size_t arr_end = json_match(body, arr_start);
+    size_t cur = arr_start + 1;
     while (cur < arr_end) {
-        size_t r = body.find("\"role\"", cur);
-        if (r == std::string::npos || r > arr_end) break;
-        size_t rc = body.find(':', r);
-        size_t rs = body.find('"', rc + 1);
-        size_t re = body.find('"', rs + 1);
-        if (rs == std::string::npos || re == std::string::npos) break;
-        std::string role = body.substr(rs + 1, re - rs - 1);
-
-        size_t c = body.find("\"content\"", re);
-        if (c == std::string::npos || c > arr_end) break;
-        size_t cc = body.find(':', c);
-        size_t cs = body.find('"', cc + 1);
-        if (cs == std::string::npos) break;
-        // content 字符串需要处理转义：读到未转义的 "
-        std::string content;
-        size_t i = cs + 1;
-        for (; i < arr_end; ++i) {
-            char ch = body[i];
-            if (ch == '\\' && i + 1 < arr_end) {
-                char n = body[i + 1];
-                if (n == 'n') content += '\n';
-                else if (n == 't') content += '\t';
-                else if (n == 'r') content += '\r';
-                else content += n;
-                ++i;
-            } else if (ch == '"') {
-                break;
-            } else {
-                content += ch;
-            }
+        cur = json_skip_ws(body, cur);
+        if (cur >= arr_end || body[cur] == ']') break;
+        if (body[cur] != '{') { ++cur; continue; }
+        const size_t obj_end = json_match(body, cur);
+        const std::string obj = body.substr(cur, obj_end - cur);
+        size_t rp = obj.find("\"role\"");
+        std::string role;
+        if (rp != std::string::npos) {
+            size_t c = obj.find(':', rp);
+            size_t q = (c == std::string::npos) ? std::string::npos : json_skip_ws(obj, c + 1);
+            size_t e = 0;
+            if (q != std::string::npos) json_read_string_at(obj, q, role, e);
         }
-        out.emplace_back(std::move(role), std::move(content));
-        cur = i + 1;
+        std::string content;
+        size_t cp = obj.find("\"content\"");
+        if (cp != std::string::npos) {
+            size_t c = obj.find(':', cp);
+            if (c != std::string::npos) content = flatten_content_value(obj, c);
+        }
+        if (role == "tool" && content.find("[tool]") != 0) {
+            content = std::string("[tool result]\n") + content;
+        }
+        if (!role.empty()) out.emplace_back(std::move(role), std::move(content));
+        cur = json_skip_ws(body, obj_end);
+        if (cur < arr_end && body[cur] == ',') ++cur;
     }
     return out;
 }
@@ -240,7 +434,7 @@ std::string read_line(int fd) {
     return line;
 }
 
-constexpr int kMaxBodyBytes = 4 * 1024 * 1024;
+constexpr int kMaxBodyBytes = 12 * 1024 * 1024;
 
 // 发送全部数据；MSG_NOSIGNAL 避免客户端断开时 SIGPIPE 杀进程
 bool send_all(int fd, const std::string& data) {
@@ -371,7 +565,8 @@ struct HttpServer::Impl {
             "\"n_ctx\":" + std::to_string(cfg.n_ctx) + ","
             "\"vocab_size\":" + std::to_string(cfg.vocab_size) + ","
             "\"has_chat_template\":" + std::string(tokenizer->has_chat_template() ? "true" : "false") + ","
-            "\"chat_template_format\":\"" + json_escape(tokenizer->chat_template_format()) + "\"}";
+            "\"chat_template_format\":\"" + json_escape(tokenizer->chat_template_format()) + "\","
+            "\"capabilities\":{\"vision\":false,\"tools\":true}}";
 
         std::string body_s;
         if (path == "/v1/models") {
@@ -477,6 +672,29 @@ struct HttpServer::Impl {
         std::vector<std::string> stops;
         json_get_stop(body, stops);
 
+        const std::string tools_prompt = extract_tools_prompt(body);
+        if (!tools_prompt.empty()) {
+            bool injected = false;
+            for (auto& m : ci.history) {
+                if (m.first == "system") {
+                    m.second += tools_prompt;
+                    injected = true;
+                    break;
+                }
+            }
+            if (!injected) {
+                ci.history.insert(ci.history.begin(), {"system", "You are a helpful assistant." + tools_prompt});
+            }
+            if (ci.system.empty()) ci.system = "You are a helpful assistant.";
+            ci.system += tools_prompt;
+            for (auto it = ci.history.rbegin(); it != ci.history.rend(); ++it) {
+                if (it->first == "user") {
+                    if (it->second.find("/no_think") == std::string::npos) it->second += "\n/no_think";
+                    break;
+                }
+            }
+        }
+
         std::vector<int> ids;
         if (path == "/v1/chat/completions" && !ci.history.empty() && tokenizer->has_chat_template()) {
             std::vector<ChatMessage> msgs;
@@ -542,11 +760,19 @@ struct HttpServer::Impl {
                 logits = engine->forward(next);
             }
             std::string tail = dec.flush();
+            generated += tail;
             if (!tail.empty()) {
                 std::string data =
                     "data: {\"choices\":[{\"delta\":{\"content\":\"" +
                     json_escape(tail) + "\"}}]}\n\n";
                 if (!send_all(client_fd, data)) return;
+            }
+            const auto calls = parse_tool_calls(generated);
+            if (!calls.empty()) {
+                const std::string tc =
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":" + tool_calls_json(calls) +
+                    "},\"finish_reason\":\"tool_calls\"}]}\n\n";
+                if (!send_all(client_fd, tc)) return;
             }
             send_all(client_fd, "data: {" + usage_json(n_gen) + "}\n\n");
             send_all(client_fd, "data: [DONE]\n\n");
@@ -575,11 +801,15 @@ struct HttpServer::Impl {
 
             std::string content;
             if (path == "/v1/chat/completions") {
+                const auto calls = parse_tool_calls(full_text);
+                const bool has_tools = !calls.empty();
                 content =
                     "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\","
-                    "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\","
-                    "\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(full_text) +
-                    "\"}}]," + usage_json(n_gen) + "}";
+                    "\"choices\":[{\"index\":0,\"finish_reason\":\"" +
+                    std::string(has_tools ? "tool_calls" : "stop") +
+                    "\",\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(full_text) + "\"";
+                if (has_tools) content += ",\"tool_calls\":" + tool_calls_json(calls);
+                content += "}}]," + usage_json(n_gen) + "}";
             } else {
                 content =
                     "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
