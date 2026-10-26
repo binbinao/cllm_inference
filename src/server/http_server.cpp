@@ -53,6 +53,72 @@ bool json_get_number(const std::string& json, const std::string& key, double& ou
     return end != json.c_str() + p;
 }
 
+std::string json_unescape(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            switch (s[++i]) {
+                case 'n': o += '\n'; break;
+                case 'r': o += '\r'; break;
+                case 't': o += '\t'; break;
+                case '"': o += '"'; break;
+                case '\\': o += '\\'; break;
+                default: o += s[i]; break;
+            }
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
+
+void json_get_stop(const std::string& json, std::vector<std::string>& out) {
+    const std::string needle = "\"stop\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return;
+    p = json.find(':', p + needle.size());
+    if (p == std::string::npos) return;
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n')) ++p;
+
+    auto parse_str = [&](size_t& i) -> std::string {
+        if (i >= json.size() || json[i] != '"') return "";
+        ++i;
+        std::string raw;
+        while (i < json.size()) {
+            if (json[i] == '\\' && i + 1 < json.size()) {
+                raw += json[i];
+                raw += json[i + 1];
+                i += 2;
+                continue;
+            }
+            if (json[i] == '"') {
+                ++i;
+                break;
+            }
+            raw += json[i++];
+        }
+        return json_unescape(raw);
+    };
+
+    if (p < json.size() && json[p] == '"') {
+        std::string s = parse_str(p);
+        if (!s.empty()) out.push_back(std::move(s));
+    } else if (p < json.size() && json[p] == '[') {
+        ++p;
+        while (p < json.size() && json[p] != ']') {
+            while (p < json.size() && (json[p] == ' ' || json[p] == '\t' ||
+                                       json[p] == '\n' || json[p] == ',')) ++p;
+            if (p < json.size() && json[p] == '"') {
+                std::string s = parse_str(p);
+                if (!s.empty()) out.push_back(std::move(s));
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 // 查找 key 的布尔值
 bool json_get_bool(const std::string& json, const std::string& key, bool& out) {
     std::string needle = "\"" + key + "\"";
@@ -406,6 +472,10 @@ struct HttpServer::Impl {
         if (json_get_number(body, "max_tokens", d)) max_tokens = (int)d;
         bool stream = false;
         json_get_bool(body, "stream", stream);
+        bool has_seed = json_get_number(body, "seed", d);
+        const uint32_t seed = has_seed ? (uint32_t)d : 0;
+        std::vector<std::string> stops;
+        json_get_stop(body, stops);
 
         std::vector<int> ids;
         if (path == "/v1/chat/completions" && !ci.history.empty() && tokenizer->has_chat_template()) {
@@ -425,7 +495,9 @@ struct HttpServer::Impl {
 
         const int prompt_tokens = (int)ids.size();
         std::lock_guard<std::mutex> lock(engine_mtx);
-        std::mt19937 rng(std::random_device{}());
+        std::mt19937 rng;
+        if (has_seed) rng.seed(seed);
+        else rng.seed(std::random_device{}());
 
         std::vector<float> logits;
         try {
@@ -451,18 +523,22 @@ struct HttpServer::Impl {
 
             Utf8StreamDecoder dec;
             int n_gen = 0;
+            std::string generated;
             for (int i = 0; i < max_tokens; ++i) {
                 int next = Sampler::sample(logits, sp, rng);
                 if (tokenizer->is_eos(next)) break;
                 ids.push_back(next);
                 ++n_gen;
                 std::string piece = dec.feed(tokenizer->decode(next));
+                generated += piece;
                 if (!piece.empty()) {
                     std::string data =
                         "data: {\"choices\":[{\"delta\":{\"content\":\"" +
                         json_escape(piece) + "\"}}]}\n\n";
                     if (!send_all(client_fd, data)) return;
                 }
+                std::string stripped;
+                if (consume_stop_suffix(generated, stops, stripped)) break;
                 logits = engine->forward(next);
             }
             std::string tail = dec.flush();
@@ -484,9 +560,18 @@ struct HttpServer::Impl {
                 ids.push_back(next);
                 ++n_gen;
                 full_text += dec.feed(tokenizer->decode(next));
+                std::string stripped;
+                if (consume_stop_suffix(full_text, stops, stripped)) {
+                    full_text = std::move(stripped);
+                    break;
+                }
                 logits = engine->forward(next);
             }
             full_text += dec.flush();
+            {
+                std::string stripped;
+                if (consume_stop_suffix(full_text, stops, stripped)) full_text = std::move(stripped);
+            }
 
             std::string content;
             if (path == "/v1/chat/completions") {

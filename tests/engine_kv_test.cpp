@@ -69,6 +69,20 @@ int main() {
     }
     CHECK(threw_ctx, "prefill n_ctx+1 throws context length exceeded");
 
+    std::printf("[ctx_limit cap]\n");
+    TransformerEngine capped(model, pool, WeightMode::Quant, 8);
+    CHECK(capped.config().n_ctx == 8, "ctx_limit 8 becomes config.n_ctx");
+    bool threw_cap = false;
+    try {
+        capped.prefill(std::vector<int>(9, t));
+    } catch (const std::exception& e) {
+        threw_cap = std::string(e.what()).find("context length exceeded") != std::string::npos;
+    }
+    CHECK(threw_cap, "prefill 9 with ctx_limit=8 throws");
+    auto ok8 = capped.prefill(std::vector<int>(8, t));
+    CHECK(capped.seq_len() == 8, "prefill 8 with ctx_limit=8 ok");
+    CHECK(ok8.size() == vocab, "capped prefill returns logits");
+
     std::printf("[reset]\n");
     eng.reset_kv_cache();
     CHECK(eng.seq_len() == 0, "reset clears seq_len");

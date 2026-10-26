@@ -177,6 +177,9 @@ GgufModel GgufLoader::load(const std::string& path) {
     if (fstat(fd, &st) != 0) { fclose(f); throw std::runtime_error("fstat failed"); }
     void* base = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { fclose(f); throw std::runtime_error("mmap failed"); }
+#ifdef MADV_WILLNEED
+    (void)madvise(base, static_cast<size_t>(st.st_size), MADV_WILLNEED);
+#endif
     model.mmap_base = base;
     model.mmap_size = st.st_size;
 

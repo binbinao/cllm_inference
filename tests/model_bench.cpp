@@ -74,13 +74,14 @@ ModeResult bench_mode(const GgufModel& model, ThreadPool& pool, WeightMode mode,
         std::printf("    [%s] prefill %d token...\n", mode_name, L);
         std::fflush(stdout);
 
-        // ---- prefill：reset + 连续 forward L 个 token ----
+        // ---- prefill：reset + batched prefill(L) ----
         // 首轮作为 warmup（冷缓存），不计入；后续取最小耗时
+        const std::vector<int> ids(static_cast<size_t>(L), token_id);
         double best_prefill = 1e18;
         for (int rnd = 0; rnd < prefill_rounds + 1; ++rnd) {
             engine.reset_kv_cache();
             auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < L; ++i) engine.forward(token_id);
+            engine.prefill(ids);
             auto t1 = std::chrono::steady_clock::now();
             double ms = time_ms(t0, t1);
             if (rnd > 0 && ms < best_prefill) best_prefill = ms;

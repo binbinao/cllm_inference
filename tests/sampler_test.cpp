@@ -79,6 +79,17 @@ void test_temperature_spread() {
     CHECK(cnt1 > 40 && cnt1 < 200, "temp=1 low-prob token should appear ~5%");
 }
 
+void test_stop_suffix() {
+    std::printf("[stop suffix]\n");
+    std::string out;
+    CHECK(consume_stop_suffix("hello\n\n", {"\n\n"}, out), "detects \\n\\n");
+    CHECK(out == "hello", "strips \\n\\n");
+    CHECK(!consume_stop_suffix("hello", {"\n\n"}, out), "no match leaves false");
+    CHECK(consume_stop_suffix("abcUser:", {"\n\n", "User:"}, out), "second stop");
+    CHECK(out == "abc", "strips User:");
+    CHECK(!consume_stop_suffix("ab", {"abc"}, out), "shorter than stop");
+}
+
 }  // namespace
 
 int main() {
@@ -87,6 +98,7 @@ int main() {
     test_topk_scope();
     test_topp_tight();
     test_temperature_spread();
+    test_stop_suffix();
 
     std::printf("==== sampler_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

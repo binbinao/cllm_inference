@@ -27,8 +27,10 @@ public:
     // mode=Fp32：将所有量化权重反量化为 fp32 常驻内存，forward 走纯 float 矩阵乘。
     // mode=Fp16：将所有量化权重反量化为 fp16 常驻内存，forward 走 half->float 矩阵乘。
     // 后两者用于「量化 vs 反量化 fp32/fp16」的公平性能对比。
+    // ctx_limit>0 时硬帽为 min(模型 n_ctx, ctx_limit)；0 表示用模型 n_ctx。
     TransformerEngine(const GgufModel& model, ThreadPool& pool,
-                      WeightMode mode = WeightMode::Quant);
+                      WeightMode mode = WeightMode::Quant,
+                      int ctx_limit = 0);
     ~TransformerEngine();
 
     TransformerEngine(const TransformerEngine&) = delete;
