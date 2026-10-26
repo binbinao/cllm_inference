@@ -313,6 +313,53 @@ void test_matmul_quant() {
     CHECK_NEAR(y2[3] - y[3], 3.0, "matmul_quant bias");
 }
 
+void test_matmul_quant_batch_type(const char* name, GgmlType type) {
+    std::printf("[matmul_quant_batch %s]\n", name);
+    const int bs = block_size(type);
+    const int in_dim = (bs <= 32) ? 64 : 256;
+    const int out_dim = 40;
+    const int n_rows = 3;
+    const size_t row_bytes = (size_t)(in_dim / bs) * type_size(type);
+    std::vector<uint8_t> w(row_bytes * out_dim, 0);
+    for (int j = 0; j < out_dim; ++j) {
+        uint8_t* row = &w[(size_t)j * row_bytes];
+        for (int blk = 0; blk < in_dim / bs; ++blk) {
+            uint8_t* p = row + (size_t)blk * type_size(type);
+            put_f16(p, H1);
+            for (size_t k = 2; k < type_size(type); ++k) {
+                p[k] = (uint8_t)((k + blk + j) % 7);
+            }
+        }
+    }
+    std::vector<float> x((size_t)n_rows * in_dim);
+    for (int t = 0; t < n_rows; ++t) {
+        for (int i = 0; i < in_dim; ++i) {
+            x[(size_t)t * in_dim + i] = (float)(((i + t) % 5) - 2) * 0.5f;
+        }
+    }
+    std::vector<float> yb((size_t)n_rows * out_dim);
+    matmul_quant_batch(x.data(), w.data(), type, nullptr, in_dim, out_dim, n_rows,
+                       yb.data(), nullptr);
+    int mism = 0;
+    for (int t = 0; t < n_rows; ++t) {
+        std::vector<float> y(out_dim);
+        matmul_quant(x.data() + (size_t)t * in_dim, w.data(), type, nullptr,
+                     in_dim, out_dim, y.data(), nullptr);
+        for (int j = 0; j < out_dim; ++j) {
+            if (std::fabs(y[j] - yb[(size_t)t * out_dim + j]) > 1e-4) ++mism;
+        }
+    }
+    if (mism == 0) { ++g_pass; std::printf("  OK %d rows x %d cols\n", n_rows, out_dim); }
+    else { g_fail += mism; std::printf("  FAIL %d mismatches\n", mism); }
+}
+
+void test_matmul_quant_batch() {
+    test_matmul_quant_batch_type("Q8_0", GgmlType::Q8_0);
+    test_matmul_quant_batch_type("Q4_K", GgmlType::Q4_K);
+    test_matmul_quant_batch_type("Q5_K", GgmlType::Q5_K);
+    test_matmul_quant_batch_type("Q6_K", GgmlType::Q6_K);
+}
+
 }  // namespace
 
 int main() {
@@ -324,6 +371,7 @@ int main() {
     test_q4_k();  test_q5_k();  test_q6_k();
     test_unsupported();
     test_matmul_quant();
+    test_matmul_quant_batch();
 
     std::printf("\n==== quant_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

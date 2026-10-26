@@ -17,6 +17,10 @@
 #endif
 #endif
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace cllm {
 
 namespace {
@@ -500,9 +504,194 @@ static float vec_dot_q8_0_q8_0_neon(const uint8_t* w, const QuantizedQ8_0& qx, i
 }
 #endif
 
+#if defined(__AVX2__)
+static inline int32_t avx2_hsum_i32(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i s = _mm_add_epi32(lo, hi);
+    s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x1));
+    return _mm_cvtsi128_si32(s);
+}
+
+static inline int32_t avx2_dot_s8_s8(const int8_t* a, const int8_t* b) {
+    __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+    __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+    __m256i ax = _mm256_sign_epi8(va, va);
+    __m256i sx = _mm256_sign_epi8(vb, va);
+    __m256i p16 = _mm256_maddubs_epi16(ax, sx);
+    __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+    return avx2_hsum_i32(p32);
+}
+
+static inline int32_t avx2_dot_u8_s8(__m256i u, const int8_t* s) {
+    __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s));
+    __m256i p16 = _mm256_maddubs_epi16(u, x);
+    __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+    return avx2_hsum_i32(p32);
+}
+
+static float vec_dot_q8_0_q8_0_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 32;
+    const int64_t nb = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    float acc = 0.0f;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d_w = half_to_float(*reinterpret_cast<const uint16_t*>(w));
+        const int8_t* qw = reinterpret_cast<const int8_t*>(w + 2);
+        acc += d_w * qx_sc[b] * (float)avx2_dot_s8_s8(qw, qx_qs + b * QK);
+        w += 34;
+    }
+    return acc;
+}
+
+static float vec_dot_q4_k_q8_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* scales = w; w += 12;
+        const uint8_t* q = w;      w += 128;
+        const int64_t x_base = s * 8;
+        int is = 0;
+        for (int j = 0; j < QK; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m);
+            const float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m);
+            const float d2 = d * sc, m2 = dmin * m;
+            __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+            __m256i q4_lo = _mm256_and_si256(raw, mask_lo);
+            __m256i q4_hi = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_lo);
+            {
+                const int b_lo = (int)(x_base + is + 0);
+                int32_t dot = avx2_dot_u8_s8(q4_lo, qx_qs + (size_t)b_lo * 32);
+                acc += d1 * qx_sc[b_lo] * (float)dot;
+                acc -= m1 * qx_sc[b_lo] * (float)qx_bs[b_lo];
+            }
+            {
+                const int b_hi = (int)(x_base + is + 1);
+                int32_t dot = avx2_dot_u8_s8(q4_hi, qx_qs + (size_t)b_hi * 32);
+                acc += d2 * qx_sc[b_hi] * (float)dot;
+                acc -= m2 * qx_sc[b_hi] * (float)qx_bs[b_hi];
+            }
+            q += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
+static float vec_dot_q5_k_q8_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const int32_t* qx_bs = qx.bsums.data();
+    const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const float dmin = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const uint8_t* scales = w; w += 12;
+        const uint8_t* qh = w; w += 32;
+        const uint8_t* ql = w; w += 128;
+        const int64_t x_base = s * 8;
+        __m256i qh_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+        for (int k = 0; k < 8; ++k) {
+            uint8_t sc, m;
+            get_scale_min_k4(k, scales, sc, m);
+            const float dk = d * sc, mk = dmin * m;
+            const uint8_t* qlg = ql + (size_t)(k / 2) * 32;
+            __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qlg));
+            __m256i lo4 = (k & 1)
+                ? _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_lo)
+                : _mm256_and_si256(raw, mask_lo);
+            __m256i bit = _mm256_set1_epi8(static_cast<char>(1 << k));
+            __m256i hi = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh_v, bit), bit),
+                                         _mm256_set1_epi8(16));
+            __m256i q5 = _mm256_or_si256(lo4, hi);
+            const int b = (int)(x_base + k);
+            int32_t dot = avx2_dot_u8_s8(q5, qx_qs + (size_t)b * 32);
+            acc += dk * qx_sc[b] * (float)dot;
+            acc -= mk * qx_sc[b] * (float)qx_bs[b];
+        }
+    }
+    return acc;
+}
+
+static float vec_dot_q6_k_q8_avx2(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
+    constexpr int QK = 256;
+    const int64_t n_super = n / QK;
+    const int8_t* qx_qs = qx.qs.data();
+    const float* qx_sc = qx.scales.data();
+    const __m256i v0x0F = _mm256_set1_epi8(0x0F);
+    const __m256i v32 = _mm256_set1_epi8(32);
+    float acc = 0.0f;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const uint8_t* ql = w; w += 128;
+        const uint8_t* qh = w; w += 64;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(w); w += 16;
+        const float d = half_to_float(*reinterpret_cast<const uint16_t*>(w)); w += 2;
+        const int64_t x_base = s * 8;
+        for (int grp = 0; grp < 2; ++grp) {
+            const uint8_t* ql_g = ql + (size_t)grp * 64;
+            const uint8_t* qh_g = qh + (size_t)grp * 32;
+            const int8_t* sc_g = sc + grp * 8;
+            __m256i qh_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh_g));
+
+            auto sub = [&](int shift, bool low_in_hi, int sub_idx, const uint8_t* ql_src) {
+                __m256i qlv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql_src));
+                __m256i lo4 = low_in_hi
+                    ? _mm256_and_si256(_mm256_srli_epi16(qlv, 4), v0x0F)
+                    : _mm256_and_si256(qlv, v0x0F);
+                __m256i mask2 = _mm256_set1_epi8(static_cast<char>(3 << shift));
+                __m256i hi2 = _mm256_and_si256(qh_v, mask2);
+                if (shift != 0) {
+                    hi2 = _mm256_and_si256(_mm256_srli_epi16(hi2, shift), _mm256_set1_epi8(3));
+                }
+                __m256i q = _mm256_or_si256(lo4, _mm256_slli_epi16(hi2, 4));
+                __m256i q6 = _mm256_sub_epi8(q, v32);
+                const int b = (int)(x_base + grp * 4 + sub_idx);
+                const int8_t* qxb = qx_qs + (size_t)b * 32;
+                __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qxb));
+                __m256i ax = _mm256_sign_epi8(q6, q6);
+                __m256i sx = _mm256_sign_epi8(x, q6);
+                __m256i p16 = _mm256_maddubs_epi16(ax, sx);
+                __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+                __m128i plo = _mm256_castsi256_si128(p32);
+                __m128i phi = _mm256_extracti128_si256(p32, 1);
+                plo = _mm_add_epi32(plo, _mm_unpackhi_epi64(plo, plo));
+                plo = _mm_add_epi32(plo, _mm_shuffle_epi32(plo, 0x1));
+                phi = _mm_add_epi32(phi, _mm_unpackhi_epi64(phi, phi));
+                phi = _mm_add_epi32(phi, _mm_shuffle_epi32(phi, 0x1));
+                const float sc_a = (float)sc_g[sub_idx * 2 + 0];
+                const float sc_b = (float)sc_g[sub_idx * 2 + 1];
+                acc += d * qx_sc[b] * (sc_a * (float)_mm_cvtsi128_si32(plo) +
+                                       sc_b * (float)_mm_cvtsi128_si32(phi));
+            };
+            sub(0, false, 0, ql_g);
+            sub(2, false, 1, ql_g + 32);
+            sub(4, true,  2, ql_g);
+            sub(6, true,  3, ql_g + 32);
+        }
+    }
+    return acc;
+}
+#endif
+
 static inline float vec_dot_q8_0_q8_0(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q8_0_q8_0_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q8_0_q8_0_avx2(w, qx, n);
 #else
     return vec_dot_q8_0_q8_0_scalar(w, qx, n);
 #endif
@@ -792,6 +981,8 @@ static float vec_dot_q4_k_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int
 static inline float vec_dot_q4_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q4_k_q8_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q4_k_q8_avx2(w, qx, n);
 #else
     return vec_dot_q4_k_q8_scalar(w, qx, n);
 #endif
@@ -930,6 +1121,8 @@ static float vec_dot_q5_k_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int
 static inline float vec_dot_q5_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q5_k_q8_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q5_k_q8_avx2(w, qx, n);
 #else
     return vec_dot_q5_k_q8_scalar(w, qx, n);
 #endif
@@ -1084,6 +1277,8 @@ static float vec_dot_q6_k_q8_neon(const uint8_t* w, const QuantizedQ8_0& qx, int
 static inline float vec_dot_q6_k_q8(const uint8_t* w, const QuantizedQ8_0& qx, int64_t n) {
 #if defined(__ARM_NEON) && CLLM_HAS_SDOT
     return vec_dot_q6_k_q8_neon(w, qx, n);
+#elif defined(__AVX2__)
+    return vec_dot_q6_k_q8_avx2(w, qx, n);
 #else
     return vec_dot_q6_k_q8_scalar(w, qx, n);
 #endif
@@ -1172,6 +1367,50 @@ void matmul_quant(const float* x, const void* w, GgmlType type,
     } else {
         std::vector<float> buf(chunk_len);
         for (int j = 0; j < out_dim; ++j) row_dot(buf, j);
+    }
+}
+
+void matmul_quant_batch(const float* x, const void* w, GgmlType type,
+                        const float* bias, int in_dim, int out_dim, int n_rows,
+                        float* y, ThreadPool* pool) {
+    if (n_rows <= 0) return;
+    if (n_rows == 1) {
+        matmul_quant(x, w, type, bias, in_dim, out_dim, y, pool);
+        return;
+    }
+    const int bs = block_size(type);
+    if (bs <= 0 || in_dim % bs != 0) {
+        throw std::runtime_error("matmul_quant_batch: in_dim not divisible by block size");
+    }
+    const size_t row_bytes = (size_t)(in_dim / bs) * type_size(type);
+    const uint8_t* base = static_cast<const uint8_t*>(w);
+
+    if (has_vec_dot(type)) {
+        std::vector<QuantizedQ8_0> qxs(static_cast<size_t>(n_rows));
+        for (int t = 0; t < n_rows; ++t) {
+            quantize_row_q8_0(x + (size_t)t * in_dim, qxs[static_cast<size_t>(t)], in_dim);
+        }
+        auto col = [&](int j) {
+            const void* rp = base + (size_t)j * row_bytes;
+            for (int t = 0; t < n_rows; ++t) {
+                float acc = vec_dot_row(rp, type, qxs[static_cast<size_t>(t)], in_dim);
+                if (bias) acc += bias[j];
+                y[(size_t)t * out_dim + j] = acc;
+            }
+        };
+        if (pool && out_dim >= 256) {
+            pool->parallel_for(0, (size_t)out_dim, [&](size_t b, size_t e) {
+                for (size_t j = b; j < e; ++j) col((int)j);
+            });
+        } else {
+            for (int j = 0; j < out_dim; ++j) col(j);
+        }
+        return;
+    }
+
+    for (int t = 0; t < n_rows; ++t) {
+        matmul_quant(x + (size_t)t * in_dim, w, type, bias, in_dim, out_dim,
+                     y + (size_t)t * out_dim, pool);
     }
 }
 

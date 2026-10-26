@@ -4,6 +4,11 @@ project(cllm_inference LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(CLLM_NATIVE "Use -march=native" ON)
+if(CLLM_NATIVE AND NOT MSVC)
+    add_compile_options(-march=native)
+endif()
+
 # 内核静态库：自动收集 src/ 下所有源文件（core + server）
 file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"

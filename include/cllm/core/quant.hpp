@@ -144,4 +144,10 @@ void matmul_quant(const float* x, const void* w, GgmlType type,
                   const float* bias, int in_dim, int out_dim, float* y,
                   ThreadPool* pool = nullptr);
 
+// 权重静止的批量矩阵乘：X[n_rows, in_dim] · W[out_dim, in_dim]ᵀ
+// y 行主序 [n_rows, out_dim]。每个权重行只读一次，供 batched prefill 使用。
+void matmul_quant_batch(const float* x, const void* w, GgmlType type,
+                        const float* bias, int in_dim, int out_dim, int n_rows,
+                        float* y, ThreadPool* pool = nullptr);
+
 }  // namespace cllm
