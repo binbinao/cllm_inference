@@ -11,7 +11,9 @@
 - **完整 GGUF 解析**：支持 GGUF v2/v3，mmap 零拷贝加载
 - **量化类型全覆盖**：支持 F32 / F16 / Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K 共 13 种 GGML 量化格式
 - **零拷贝量化推理**：量化权重直接引用 mmap 数据，按输出行惰性反量化，无需加载期全量展开为 float32（0.5B Q4_K_M 常驻内存 ~430MB）
-- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 六种权重走 vec_dot 快路径；在 Apple Silicon 上启用 ARMv8.2 SDOT NEON 指令，相对 "反量化 + float matmul" 提速 **3-7x**
+- **整数点积内核**：激活在线量化为 Q8_0，Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K 六种权重走 vec_dot 快路径；Apple Silicon 用 ARMv8.2 SDOT NEON，x86_64 上 Q8_0/Q4_K/Q5_K/Q6_K 走 AVX2；相对 "反量化 + float matmul" 提速 **3-7x**
+- **Prefix Cache + batched prefill**：多轮对话复用公共前缀 KV；新后缀按权重静止批量矩阵乘，仅最后一枚 token 计算输出层
+- **上下文硬限制**：`seq_len` 达到模型 `n_ctx` 时明确报错，KV 按上下文长度预留，避免扩容拷贝
 - **通用 Transformer 内核**：RMSNorm、NEOX RoPE、GQA Attention、SwiGLU FFN、KV Cache
 - **CPU 多线程**：手写线程池，按行/分块并行矩阵乘
 - **分词与采样**：BPE（gpt2 类）+ SentencePiece 双模式，支持 temperature / top-p / top-k 采样
@@ -67,7 +69,7 @@
 | 依赖 | 要求 | 说明 |
 |------|------|------|
 | 编译器 | C++20 支持（clang++ 或 g++） | macOS 自带 clang++，Linux 用 g++/clang++ |
-| 构建工具 | `make` 或 `cmake`（二选一） | 推荐 `make`，无需 cmake |
+| 构建工具 | `make` 或 `cmake`（二选一） | 推荐 `make`，无需 cmake。Release 默认 `-O3 -march=native`（CMake 可用 `-DCLLM_NATIVE=OFF` 关闭） |
 
 > macOS 无需额外安装；Linux 确保已安装 `build-essential`（g++/make）。
 
@@ -138,7 +140,7 @@ cllm_inference --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
 cllm_inference --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
   --prompt "写一首关于春天的短诗" --temperature 0.8 --top-p 0.9 --max-tokens 60
 
-# 指定线程数
+# 指定线程数（结束后打印 prefill / decode tok/s）
 cllm_inference --model models/xxx.gguf --prompt "你好" --threads 8
 ```
 
@@ -204,8 +206,8 @@ curl http://127.0.0.1:8080/v1/completions \
 | GET | `/health` | 健康检查 |
 | GET | `/v1/model/info` | 当前加载模型的元信息（架构、层数、上下文、模板格式） |
 | GET | `/v1/models` | OpenAI 兼容的模型列表（当前模型包装为 data 数组） |
-| POST | `/v1/completions` | 文本补全（`prompt` + 采样参数，支持 `stream`） |
-| POST | `/v1/chat/completions` | 对话补全（`messages` 数组，返回 OpenAI chat.completion 结构） |
+| POST | `/v1/completions` | 文本补全（`prompt` + 采样参数，支持 `stream`；非流式含 `usage`） |
+| POST | `/v1/chat/completions` | 对话补全（原生多轮 `messages` 模板；非流式含 `usage`） |
 | OPTIONS | `/*` | CORS 预检，允许所有源 |
 | GET | `/` 、`/web/*`、`/models.json` | 托管运行目录下 `web/` 前端静态资源（若存在） |
 
@@ -371,7 +373,9 @@ cllm_inference/
 │   ├── core/               # 引擎核心实现
 │   └── server/             # HTTP 服务实现
 ├── tests/                  # 单元测试与基准
-│   ├── quant_test.cpp      # 13 种量化反量化 + matmul_quant
+│   ├── quant_test.cpp      # 13 种量化反量化 + matmul_quant / batch
+│   ├── tokenizer_test.cpp  # 哈希词表、多轮模板、多 EOS、UTF-8 流式
+│   ├── engine_kv_test.cpp  # Prefix Cache / n_ctx / skip-logits
 │   ├── threadpool_test.cpp # 线程池并行一致性
 │   ├── sampler_test.cpp    # 采样器行为
 │   ├── bench.cpp           # 量化内核吞吐基准

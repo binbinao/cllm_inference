@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CXX="${CXX:-clang++}"
-CXXFLAGS="-std=c++20 -O2 -Iinclude"
+CXXFLAGS="-std=c++20 -O3 -march=native -Iinclude"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
@@ -23,6 +23,8 @@ run_case quant_test src/core/quant.cpp src/core/thread_pool.cpp
 run_case threadpool_test src/core/thread_pool.cpp
 run_case threadpool_stress_test src/core/thread_pool.cpp
 run_case sampler_test src/core/sampler.cpp
+run_case tokenizer_test src/core/tokenizer.cpp src/core/gguf.cpp src/core/quant.cpp src/core/thread_pool.cpp
+run_case engine_kv_test src/core/engine.cpp src/core/gguf.cpp src/core/quant.cpp src/core/thread_pool.cpp
 
 if [[ "${1:-}" == "--bench" ]]; then
     echo "== 编译并运行 bench =="

@@ -42,6 +42,12 @@ if(CLLM_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_executable(sampler_test tests/sampler_test.cpp)
     target_link_libraries(sampler_test PRIVATE cllm_core Threads::Threads)
 
+    add_executable(tokenizer_test tests/tokenizer_test.cpp)
+    target_link_libraries(tokenizer_test PRIVATE cllm_core Threads::Threads)
+
+    add_executable(engine_kv_test tests/engine_kv_test.cpp)
+    target_link_libraries(engine_kv_test PRIVATE cllm_core Threads::Threads)
+
     add_executable(bench tests/bench.cpp)
     target_link_libraries(bench PRIVATE cllm_core Threads::Threads)
 
@@ -49,6 +55,8 @@ if(CLLM_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_test(NAME threadpool COMMAND threadpool_test)
     add_test(NAME threadpool_stress COMMAND threadpool_stress_test)
     add_test(NAME sampler    COMMAND sampler_test)
+    add_test(NAME tokenizer  COMMAND tokenizer_test)
+    add_test(NAME engine_kv  COMMAND engine_kv_test WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # ---- 安装规则 ----
